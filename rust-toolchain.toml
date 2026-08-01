@@ -1,0 +1,9 @@
+[toolchain]
+# pinned to the GNU host toolchain (not MSVC) -- this machine's MSVC
+# install is missing msvcrt.lib (confirmed absent from both the VC Tools
+# lib dir and the Windows SDK's um\x64 dir, not just a PATH/vcvarsall.bat
+# issue), so link.exe fails on every host-side build script. MSYS64/GCC's
+# linker (already on PATH) has no such gap.
+channel = "nightly-x86_64-pc-windows-gnu"
+components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
+targets = ["x86_64-unknown-none", "x86_64-unknown-uefi"]
