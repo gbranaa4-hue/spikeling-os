@@ -16,9 +16,11 @@ mod allocator;
 mod ata;
 mod fs;
 mod console;
+mod elf;
 mod gdt;
 mod interrupts;
 mod keyboard;
+mod loader;
 mod memory;
 mod mouse;
 mod network;
@@ -263,6 +265,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .unwrap(),
         Err(e) => writeln!(port, "milestone 30: FAILED to create test processes -- {e}").unwrap(),
     }
+
+    // MILESTONE 35: a third hardcoded process slot (FDTEST_PROCESS),
+    // running loader::FDTEST_PROGRAM via the SAME safe `runproc`-style
+    // mechanism as process A/B -- see process.rs's FDTEST_PROCESS static
+    // doc comment for why this exists alongside (not instead of)
+    // `runfile fdtestprog`. Created here, right after process A/B, while
+    // the same local frame_allocator/phys_mem_offset are conveniently
+    // still in scope.
+    match process::init_fdtest_process(&mut frame_allocator, phys_mem_offset, &loader::FDTEST_PROGRAM) {
+        Ok(()) => writeln!(port, "milestone 35: FDTEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 35: FAILED to create FDTEST_PROCESS -- {e}").unwrap(),
+    }
+
+    // MILESTONE 34: real general program loader. `frame_allocator`'s
+    // last boot-time consumer was process::init_test_processes just
+    // above -- nothing later in kernel_main needs it -- so it's moved
+    // (by value) into memory.rs's global static here, alongside
+    // phys_mem_offset, so loader.rs's `runfile` shell command can
+    // allocate fresh physical frames for a NEW process's private page
+    // tables from arbitrary, LATER, shell-command-driven code, not just
+    // the handful of one-time boot-time setup calls every earlier
+    // milestone threaded it through directly.
+    memory::set_phys_mem_offset(phys_mem_offset);
+    memory::install_frame_allocator(frame_allocator);
+    writeln!(
+        port,
+        "milestone 34: frame allocator + phys-mem offset published globally -- 'runfile PATH' can now load and run programs from the real filesystem"
+    )
+    .unwrap();
+    loader::self_test_size_check();
+    loader::self_test_fdtest_program();
+    // MILESTONE 36: real ELF64 parser self-test -- parses the embedded
+    // testelf.elf (a genuine, externally-built, multi-segment ELF64
+    // executable) once at boot, independent of whether `seedtestelf`/
+    // `runelf` are ever typed at the shell, so every boot's serial log
+    // carries direct proof elf::parse() reads the real ELF structure
+    // correctly.
+    loader::self_test_elf_parse();
 
     // MILESTONE 9: real LIF neuron network -- initialized before
     // interrupts are enabled (stage 5b, below) so it's ready the

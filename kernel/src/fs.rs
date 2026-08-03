@@ -22,15 +22,44 @@
 //! root (no `mkdir a/b`), and `write`/`read`/`rm` accept one optional
 //! `DIR/` prefix (no `a/b/c`) -- honest, disclosed depth cap of 1,
 //! matching the same "deliberately minimal" spirit as the 4096-byte
-//! file cap above. Because a subdirectory's table is capped at one
-//! 512-byte sector, it holds at most the same 8 entries as root, and
-//! because subdirectory entries are never themselves allowed to be
-//! directories, there is no recursive-occupancy scan to write --
-//! `collect_occupied` only ever needs to look one level deep. `rm`
-//! refuses to remove a directory entry outright (empty or not) --
-//! there is no rmdir/recursive-delete yet, so refusing unconditionally
-//! is the honest, safe choice rather than silently orphaning a
-//! subdirectory's own pool sector or its files' sectors.
+//! file cap above.
+//!
+//! MILESTONE 32: real ARBITRARY-DEPTH subdirectory nesting, plus
+//! `rmdir`. **No on-disk format change was needed for the nesting
+//! part** -- a subdirectory's table was already, since Milestone 28,
+//! stored in the IDENTICAL on-disk format as the root table (same
+//! `DirEntry` layout, same one-sector allocation out of the same
+//! shared pool), so a subdirectory entry's `start_lba` could already
+//! point at a table that itself contained further subdirectory
+//! entries; Milestone 28 simply capped the *logic* that walks that
+//! format at one level (`resolve_table` rejected anything past a
+//! single `DIR/NAME`, and `mkdir` rejected any `/` in its argument at
+//! all). This milestone replaces that one-level walk with
+//! `resolve_dir_lba`, a generic loop over an arbitrary-depth
+//! `/`-separated chain of components starting at the root, so
+//! `write`/`read`/`rm`/`mkdir`/`rmdir`/`ls` all transparently support
+//! any depth now -- callers (the shell) additionally layer a real
+//! `cd`/current-working-directory concept on top so a user doesn't
+//! have to type a full path every time (see shell.rs). Because a
+//! corrupted disk could in principle make a subdirectory's start_lba
+//! chain cycle back on itself, `resolve_dir_lba` and the now-recursive
+//! `collect_occupied` both enforce a defensive `MAX_DEPTH` (32) so
+//! that case fails with an error instead of recursing forever and
+//! blowing the kernel's stack -- not a deliberate feature cap; real
+//! usable depth is bounded far below that anyway by the shared
+//! 64-sector pool (every directory level, like every file, consumes at
+//! least one pool sector for its own table).
+//!
+//! `rmdir NAME` mirrors Milestone 22's file-delete reclamation exactly:
+//! it refuses (real check, not a stub) unless the target directory's
+//! own table is completely empty, then clears the parent's entry for
+//! it -- freeing both the directory's slot in its parent AND its
+//! one-sector table back into the shared pool for a later
+//! `write`/`mkdir` to reuse, via the exact same "recompute occupancy
+//! from currently-used entries" mechanism `collect_occupied` already
+//! used for files. `rmdir` never touches a directory's contents itself
+//! (no recursive delete) -- that's a deliberately different, more
+//! dangerous operation this milestone does not implement.
 //!
 //! Still deliberately minimal, disclosed rather than hidden: no
 //! fragmentation-avoiding allocator and no directory/pool compaction
@@ -39,8 +68,10 @@
 //! total free sectors would suffice, because free space isn't
 //! necessarily contiguous and nothing moves existing files to make
 //! room. Subdirectories eat into that same shared pool too (one
-//! sector per `mkdir`), so heavy subdirectory use leaves less pool
-//! space for file data.
+//! sector per `mkdir`, at ANY depth now), so heavy subdirectory use
+//! leaves less pool space for file data. Each directory table (root or
+//! any subdirectory, at any depth) is still capped at the original 8
+//! entries -- nesting deeper doesn't change that per-level cap.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -54,8 +85,18 @@ const NAME_LEN: usize = 16;
 const ENTRY_LEN: usize = NAME_LEN + 1 + 1 + 2 + 4 + 1; // name + used-flag + is_dir-flag + u16 len + u32 start_lba + u8 sector_count
 const SECTOR_SIZE: usize = 512;
 const MAX_FILE_SECTORS: usize = 8; // real per-file cap: 8 * 512 = 4096 bytes
-const MAX_FILE_BYTES: usize = MAX_FILE_SECTORS * SECTOR_SIZE;
-const NUM_DATA_SECTORS: usize = MAX_ENTRIES * MAX_FILE_SECTORS; // shared pool, used by both file data AND subdirectory tables
+// MILESTONE 35: pub(crate) (was private) so process.rs's fdwrite-syscall
+// implementation (write_fd()) can cap an open fd's in-kernel write
+// buffer against the EXACT same real limit fs::write_file() itself
+// enforces, rather than a second, potentially-drifting copy of "4096".
+pub(crate) const MAX_FILE_BYTES: usize = MAX_FILE_SECTORS * SECTOR_SIZE;
+const NUM_DATA_SECTORS: usize = MAX_ENTRIES * MAX_FILE_SECTORS; // shared pool, used by both file data AND subdirectory tables at any depth
+
+// MILESTONE 32: defensive recursion guard for resolve_dir_lba and
+// collect_occupied -- see the module doc comment above for why this is
+// a safety net against a hypothetical corrupted/cyclic disk, not a
+// deliberately chosen feature limit.
+const MAX_DEPTH: usize = 32;
 
 #[derive(Clone, Copy)]
 struct DirEntry {
@@ -78,11 +119,11 @@ impl DirEntry {
     }
 }
 
-// Loads a directory table (root OR a subdirectory's own one-sector
-// table) from an arbitrary LBA -- root always lives at the fixed
-// DIR_LBA, a subdirectory's table lives wherever it was allocated out
-// of the shared data pool, recorded as that subdirectory's own
-// start_lba in its parent's entry.
+// Loads a directory table (root OR any subdirectory's own one-sector
+// table, at any depth) from an arbitrary LBA -- root always lives at
+// the fixed DIR_LBA, a subdirectory's table lives wherever it was
+// allocated out of the shared data pool, recorded as that
+// subdirectory's own start_lba in its parent's entry.
 fn load_dir_at(lba: u32) -> [DirEntry; MAX_ENTRIES] {
     let mut buf = [0u8; 512];
     let mut entries = [DirEntry::empty(); MAX_ENTRIES];
@@ -130,18 +171,49 @@ fn name_bytes(name: &str) -> [u8; NAME_LEN] {
     out
 }
 
-// Splits a `write`/`read`/`rm` argument into the directory table it
-// lives in (root, or a resolved one-level-deep subdirectory) and the
-// leaf name within that table -- rejects anything past one level
-// (`a/b/c`) with an honest error rather than silently only using the
-// first two components.
+// MILESTONE 32: walks an arbitrary-depth, '/'-separated chain of
+// directory components starting at the root table (DIR_LBA), returning
+// the LBA of the table found at the end of the chain. An empty path
+// resolves to root itself (the base case used when a leaf lives
+// directly at the top level). Each component in between must already
+// exist and be a directory -- this is the generalization of Milestone
+// 28's one-level-only `resolve_dir_lba`, made possible with NO on-disk
+// format change (see module doc comment).
+fn resolve_dir_lba(path: &str) -> Result<u32, String> {
+    if path.is_empty() {
+        return Ok(DIR_LBA);
+    }
+    let mut lba = DIR_LBA;
+    for (depth, comp) in path.split('/').enumerate() {
+        if comp.is_empty() {
+            return Err(format!("'{path}' -- invalid path (empty component)"));
+        }
+        if depth >= MAX_DEPTH {
+            return Err(format!("'{path}' -- path too deep (max {MAX_DEPTH} levels)"));
+        }
+        let table = load_dir_at(lba);
+        let target = name_bytes(comp);
+        let entry =
+            table.iter().find(|e| e.used && e.name == target).ok_or_else(|| format!("no such directory '{comp}'"))?;
+        if !entry.is_dir {
+            return Err(format!("'{comp}' is a file, not a directory"));
+        }
+        lba = entry.start_lba;
+    }
+    Ok(lba)
+}
+
+// Splits a write/read/rm/mkdir/rmdir path into the directory table its
+// leaf lives in (root, or an arbitrary-depth resolved subdirectory) and
+// the leaf name within that table. MILESTONE 32: previously rejected
+// anything past one `DIR/NAME` level; now delegates the "directory
+// part" (everything before the final '/') to the arbitrary-depth
+// resolve_dir_lba above.
 fn resolve_table<'a>(path: &'a str) -> Result<(u32, &'a str), String> {
-    match path.split_once('/') {
+    match path.rsplit_once('/') {
         Some((dir, name)) => {
-            if name.is_empty() || name.contains('/') {
-                return Err(format!(
-                    "'{path}' -- only one level of subdirectory nesting is supported (DIR/NAME, not DIR/SUB/NAME)"
-                ));
+            if name.is_empty() {
+                return Err(format!("'{path}' -- missing file/directory name"));
             }
             Ok((resolve_dir_lba(dir)?, name))
         }
@@ -149,49 +221,39 @@ fn resolve_table<'a>(path: &'a str) -> Result<(u32, &'a str), String> {
     }
 }
 
-fn resolve_dir_lba(dir_name: &str) -> Result<u32, String> {
-    let root = load_dir_at(DIR_LBA);
-    let target = name_bytes(dir_name);
-    let entry = root
-        .iter()
-        .find(|e| e.used && e.name == target)
-        .ok_or_else(|| format!("no such directory '{dir_name}'"))?;
-    if !entry.is_dir {
-        return Err(format!("'{dir_name}' is a file, not a directory"));
-    }
-    Ok(entry.start_lba)
-}
-
 // Every currently-occupied pool sector, disk-wide -- both files' data
-// AND every subdirectory's own one-sector table -- so allocation never
-// hands out a sector already claimed by some OTHER directory's entry.
-// Subdirectory entries are never themselves directories (one level of
-// nesting only), so this only ever needs to recurse one level deep.
-// `exclude`, when given, is the (start_lba, sector_count) of the
-// allocation currently being replaced in-place, so rewriting an
-// existing file/subdir doesn't see its own old sectors as busy.
+// AND every subdirectory's own one-sector table, at ANY depth now
+// (MILESTONE 32 generalizes this from Milestone 28's one-level-only
+// recursion) -- so allocation never hands out a sector already claimed
+// by some OTHER directory's entry anywhere in the tree. `exclude`, when
+// given, is the (start_lba, sector_count) of the allocation currently
+// being replaced in-place, so rewriting an existing file/subdir doesn't
+// see its own old sectors as busy. `MAX_DEPTH` is the same defensive
+// cycle guard as resolve_dir_lba, not a feature limit.
 fn collect_occupied(exclude: Option<(u32, u8)>) -> Vec<(u32, u8)> {
     let mut ranges = Vec::new();
-    let root = load_dir_at(DIR_LBA);
-    for e in root.iter() {
-        if !e.used || e.sector_count == 0 {
-            continue;
-        }
-        ranges.push((e.start_lba, e.sector_count));
-        if e.is_dir {
-            for se in load_dir_at(e.start_lba).iter() {
-                if se.used && se.sector_count > 0 {
-                    ranges.push((se.start_lba, se.sector_count));
-                }
-            }
-        }
-    }
+    collect_occupied_at(DIR_LBA, &mut ranges, 0);
     if let Some(ex) = exclude {
         if let Some(pos) = ranges.iter().position(|&r| r == ex) {
             ranges.remove(pos);
         }
     }
     ranges
+}
+
+fn collect_occupied_at(table_lba: u32, ranges: &mut Vec<(u32, u8)>, depth: usize) {
+    if depth >= MAX_DEPTH {
+        return; // corrupted/cyclic disk guard -- see module doc comment
+    }
+    for e in load_dir_at(table_lba).iter() {
+        if !e.used || e.sector_count == 0 {
+            continue;
+        }
+        ranges.push((e.start_lba, e.sector_count));
+        if e.is_dir {
+            collect_occupied_at(e.start_lba, ranges, depth + 1);
+        }
+    }
 }
 
 // First-fit scan over the shared data pool (pool-relative sector
@@ -212,29 +274,32 @@ fn find_free_span(occupied: &[(u32, u8)], needed: usize) -> Option<u32> {
     None
 }
 
-pub fn make_dir(name: &str) -> Result<(), String> {
-    if name.contains('/') {
-        return Err(
-            "mkdir only supports creating a directory directly under the root (no 'mkdir a/b')".to_string(),
-        );
-    }
-    let mut root = load_dir_at(DIR_LBA);
+// MILESTONE 32: `path` used to be a single bare name restricted to
+// directly-under-root; it's now a full path (e.g. `a/b/c`), resolved
+// via the same resolve_table every file operation uses, so a new
+// directory can be created at any already-existing depth. The shell
+// layers a real `cd`/CWD concept on top so a user normally just types
+// the leaf name (see shell.rs's `resolve_arg`).
+pub fn make_dir(path: &str) -> Result<(), String> {
+    let (table_lba, name) = resolve_table(path)?;
+    let mut table = load_dir_at(table_lba);
     let target_name = name_bytes(name);
 
-    if root.iter().any(|e| e.used && e.name == target_name) {
+    if table.iter().any(|e| e.used && e.name == target_name) {
         return Err(format!("'{name}' already exists"));
     }
-    let slot = root.iter().position(|e| !e.used).ok_or_else(|| "directory full (max 8 entries)".to_string())?;
+    let slot = table.iter().position(|e| !e.used).ok_or_else(|| "directory full (max 8 entries)".to_string())?;
 
     let occupied = collect_occupied(None);
     let start_pool =
         find_free_span(&occupied, 1).ok_or_else(|| "not enough free disk space (fragmented or full)".to_string())?;
-    let table_lba = FILE_DATA_START_LBA + start_pool;
+    let new_table_lba = FILE_DATA_START_LBA + start_pool;
 
-    save_dir_at(table_lba, &[DirEntry::empty(); MAX_ENTRIES]).map_err(|e| e.to_string())?;
+    save_dir_at(new_table_lba, &[DirEntry::empty(); MAX_ENTRIES]).map_err(|e| e.to_string())?;
 
-    root[slot] = DirEntry { used: true, is_dir: true, name: target_name, len: 0, start_lba: table_lba, sector_count: 1 };
-    save_dir_at(DIR_LBA, &root).map_err(|e| e.to_string())?;
+    table[slot] =
+        DirEntry { used: true, is_dir: true, name: target_name, len: 0, start_lba: new_table_lba, sector_count: 1 };
+    save_dir_at(table_lba, &table).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -317,9 +382,35 @@ pub fn delete_file(path: &str) -> Result<(), String> {
     let target_name = name_bytes(name);
     let slot = entries.iter().position(|e| e.used && e.name == target_name).ok_or_else(|| format_no_such_file(name))?;
     if entries[slot].is_dir {
-        return Err(format!("'{name}' is a directory -- rm does not remove directories (no rmdir yet)"));
+        return Err(format!("'{name}' is a directory -- use rmdir to remove an (empty) directory, rm only removes files"));
     }
     entries[slot] = DirEntry::empty(); // frees both the directory slot and its data-pool sectors for reuse
+    save_dir_at(table_lba, &entries).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// MILESTONE 32: removes an EMPTY directory -- a real check (loads the
+// target's own table and refuses unless every one of its entries is
+// unused), matching real-world `rmdir` semantics rather than silently
+// recursing into a "rm -rf". Mirrors delete_file's reclamation exactly:
+// clearing the parent's slot frees both that slot AND the directory's
+// one-sector table back into the shared pool, recomputed the next time
+// collect_occupied runs -- the identical mechanism Milestone 22 built
+// for file deletes, just applied to a directory's own entry instead of
+// a file's.
+pub fn remove_dir(path: &str) -> Result<(), String> {
+    let (table_lba, name) = resolve_table(path)?;
+    let mut entries = load_dir_at(table_lba);
+    let target_name = name_bytes(name);
+    let slot = entries.iter().position(|e| e.used && e.name == target_name).ok_or_else(|| format_no_such_file(name))?;
+    if !entries[slot].is_dir {
+        return Err(format!("'{name}' is a file, not a directory -- use rm to remove files"));
+    }
+    let sub_table = load_dir_at(entries[slot].start_lba);
+    if sub_table.iter().any(|e| e.used) {
+        return Err(format!("'{name}' is not empty -- rmdir only removes empty directories"));
+    }
+    entries[slot] = DirEntry::empty(); // frees both the parent's slot and the (now-confirmed-empty) directory's own table sector for reuse
     save_dir_at(table_lba, &entries).map_err(|e| e.to_string())?;
     Ok(())
 }

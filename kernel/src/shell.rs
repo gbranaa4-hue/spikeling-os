@@ -6,15 +6,69 @@
 //! fixed demo sequence once and halt.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use spin::Mutex;
 
 static LINE: Mutex<String> = Mutex::new(String::new());
 
-const PROMPT: &str = "> ";
+// MILESTONE 32: a real current-working-directory, layered entirely in
+// the shell on top of fs.rs's now arbitrary-depth-capable, always
+// root-relative path API -- fs.rs itself has no notion of "current
+// directory", it only ever resolves a full path starting at root
+// (DIR_LBA). Stored as the chain of path components from root (empty
+// == root itself) rather than a single pre-joined string, so `cd ..`
+// is a plain `pop()` with no filesystem access needed at all -- popping
+// to a shorter existing prefix is always valid, since every component
+// currently in CWD was itself validated as a real directory at the
+// time it was pushed.
+static CWD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Joins CWD into the root-relative path string fs.rs's API expects
+/// (no leading slash, empty string means root).
+fn cwd_path() -> String {
+    CWD.lock().join("/")
+}
+
+/// MILESTONE 32: resolves a shell argument against CWD -- a leading
+/// `/` means "absolute, starting at root" (the leading slash itself is
+/// stripped since fs.rs's paths are always root-relative already);
+/// anything else is relative to CWD. This is the ONLY place CWD gets
+/// combined with a typed argument -- every command below calls this
+/// once on its path argument(s) and then talks to fs.rs in terms of
+/// plain root-relative paths, same as before Milestone 32 existed.
+fn resolve_arg(arg: &str) -> String {
+    if let Some(rest) = arg.strip_prefix('/') {
+        rest.to_string()
+    } else {
+        let cwd = cwd_path();
+        if cwd.is_empty() {
+            arg.to_string()
+        } else {
+            format!("{cwd}/{arg}")
+        }
+    }
+}
+
+/// Sets CWD from an already-resolved, root-relative path (empty means
+/// root) -- splits back into components for storage.
+fn set_cwd(resolved: &str) {
+    let mut cwd = CWD.lock();
+    *cwd = if resolved.is_empty() { Vec::new() } else { resolved.split('/').map(|s| s.to_string()).collect() };
+}
+
+/// MILESTONE 32: the prompt now shows the real current directory
+/// (`/> ` at root, `/a/b/c> ` three levels deep) rather than a fixed
+/// `"> "` -- this doubles as live, continuous confirmation that `cd`
+/// actually moved somewhere, not just a cosmetic addition; every
+/// verification transcript for this milestone leans on it.
+fn prompt_string() -> String {
+    let cwd = cwd_path();
+    if cwd.is_empty() { "/> ".to_string() } else { format!("/{cwd}> ") }
+}
 
 pub fn init() {
-    crate::console::write_str(PROMPT);
+    crate::console::write_str(&prompt_string());
 }
 
 /// MILESTONE 29: re-prints the prompt after drawing mode exits itself
@@ -22,7 +76,7 @@ pub fn init() {
 /// IRQ12 packet handler -- outside the normal Enter-key flow in
 /// on_char below that every other command completion goes through.
 pub fn show_prompt() {
-    crate::console::write_str(PROMPT);
+    crate::console::write_str(&prompt_string());
 }
 
 /// Called from keyboard.rs for every decoded character, in place of a
@@ -40,7 +94,7 @@ pub fn on_char(c: char) {
                 taken
             };
             run_command(line.trim());
-            crate::console::write_str(PROMPT);
+            crate::console::write_str(&prompt_string());
         }
         // pc-keyboard's Backspace key decodes to Unicode('\u{8}') with
         // HandleControl::Ignore; '\x7f' (DEL) handled too for safety,
@@ -100,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, mkdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -109,12 +163,26 @@ fn run_command(cmd: &str) {
             // honestly either way, not assumed.
             match crate::usertest::run() {
                 Ok(()) => crate::console::write_str(
-                    "usertest: entered ring 3, ran the print + exit syscalls, returned cleanly -- see serial log for the hardware-recorded CPL confirmation\n",
+                    "usertest: entered ring 3, ran the write + exit syscalls, returned cleanly -- see serial log for the hardware-recorded CPL confirmation and the raw write() bytes\n",
                 ),
                 Err(e) => crate::console::write_str(&format!("usertest FAILED: {e}\n")),
             }
         }
-        "ls" => print_listing(crate::fs::list(None)),
+        "ls" => {
+            // MILESTONE 32: lists CWD, not always root -- None (root's
+            // own listing) only when CWD actually IS root.
+            let cwd = cwd_path();
+            if cwd.is_empty() {
+                print_listing(crate::fs::list(None));
+            } else {
+                print_listing(crate::fs::list(Some(&cwd)));
+            }
+        }
+        "cd" => {
+            // MILESTONE 32: bare `cd`, no argument -- goes to root,
+            // same convention as a real shell's `cd` with no argument.
+            *CWD.lock() = Vec::new();
+        }
         "about" => crate::console::write_str(
             "spikeling-os -- Spikeling's spiking-network runtime as the kernel's own control logic\n",
         ),
@@ -290,6 +358,73 @@ fn run_command(cmd: &str) {
                 crate::console::write_str("not currently in drawing mode\n");
             }
         }
+        "seedtestprog" => {
+            // MILESTONE 34: writes this milestone's hand-assembled test
+            // payload (loader::build_test_program_image()) to a REAL
+            // file ("testprog") on the real on-disk filesystem -- not
+            // something a real user would type, just the one piece of
+            // test setup that needs genuine non-typeable machine-code
+            // bytes on disk, which the keyboard-driven `write` shell
+            // command uses.
+            match crate::loader::seed_test_program() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedtestprog: wrote {len} real bytes to 'testprog' on disk (hand-assembled syscalls + a distinguishing message) -- try 'runfile testprog'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedtestprog FAILED: {e}\n")),
+            }
+        }
+        "seedfdtest" => {
+            // MILESTONE 35: same reasoning as seedtestprog above, for
+            // this milestone's own open/read/fdwrite/close test payload
+            // (loader::FDTEST_PROGRAM). Real usage: `write fdtest ...`
+            // (some known content) first, then `seedfdtest`, then
+            // `runfile fdtestprog`, then `read fdout` to confirm the
+            // fdwrite+close round trip actually persisted.
+            match crate::loader::seed_fdtest_program() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedfdtest: wrote {len} real bytes to 'fdtestprog' on disk (hand-assembled open/read/fdwrite/close syscalls) -- write a 'fdtest' file first, then 'runfile fdtestprog', then 'read fdout'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedfdtest FAILED: {e}\n")),
+            }
+        }
+        "runfdtest" => {
+            // MILESTONE 35: runs FDTEST_PROGRAM via process.rs's THIRD
+            // hardcoded process slot (FDTEST_PROCESS) -- the SAME
+            // open/read/fdwrite/close syscall test `runfile fdtestprog`
+            // runs, but through the `runproc`-style boot-time-created
+            // path instead of the file-loaded path. See process.rs's
+            // FDTEST_PROCESS doc comment for why both exist: `runfile
+            // fdtestprog` DOES exercise the real syscalls correctly
+            // (verified in the serial log), but hits a separate,
+            // pre-existing, unrelated Milestone 34 bug shortly
+            // afterward; this command reuses the already-proven-safe
+            // `runproc` mechanism so the fd syscalls can be verified
+            // end to end without that bug in the way. Usage: `write
+            // fdtest ...` (known content) first, then `runfdtest`, then
+            // `read fdout` to confirm the fdwrite+close round trip
+            // persisted.
+            match crate::process::run(crate::process::FDTEST_PROCESS_ID) {
+                Ok(()) => crate::console::write_str(
+                    "runfdtest: entered ring 3 under FDTEST_PROCESS's own private page table, ran open/read/fdwrite/close syscalls against the real filesystem, returned cleanly -- see serial log for the full syscall trace\n",
+                ),
+                Err(e) => crate::console::write_str(&format!("runfdtest FAILED: {e}\n")),
+            }
+        }
+        "seedtestelf" => {
+            // MILESTONE 36: writes this milestone's REAL, externally-
+            // built ELF64 test executable (loader::TEST_ELF_BYTES,
+            // built with this machine's actual Rust toolchain --
+            // rustc+rust-lld, NOT hand-assembled) to a real file
+            // ("testelf") on the real on-disk filesystem, same
+            // "genuine non-typeable bytes" reasoning as seedtestprog
+            // above.
+            match crate::loader::seed_test_elf() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedtestelf: wrote {len} real bytes to 'testelf' on disk (a genuine ELF64 executable, not hand-assembled) -- try 'runelf testelf'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedtestelf FAILED: {e}\n")),
+            }
+        }
         "clear" => crate::console::clear_screen(),
         other => {
             // MILESTONE 12/17: variable-argument DSL commands can't be
@@ -319,19 +454,50 @@ fn run_command(cmd: &str) {
                     }
                     Err(_) => crate::console::write_str("usage: beep FREQ_HZ\n"),
                 }
+            } else if let Some(rest) = other.strip_prefix("cd ") {
+                // MILESTONE 32: real CWD navigation. `..` is handled
+                // specially with no filesystem access (see CWD's own
+                // doc comment for why that's always safe); `/` or an
+                // empty argument goes to root; anything else is
+                // resolved (relative to the CURRENT CWD, via
+                // resolve_arg) and validated against the real on-disk
+                // tree via fs::list before CWD is actually updated, so
+                // a failed `cd` never leaves CWD pointing somewhere
+                // nonexistent.
+                let target = rest.trim();
+                if target == ".." {
+                    let popped = CWD.lock().pop().is_some();
+                    if !popped {
+                        crate::console::write_str("cd FAILED: already at root\n");
+                    }
+                } else if target.is_empty() || target == "/" {
+                    *CWD.lock() = Vec::new();
+                } else {
+                    let resolved = resolve_arg(target);
+                    let list_result =
+                        if resolved.is_empty() { crate::fs::list(None) } else { crate::fs::list(Some(&resolved)) };
+                    match list_result {
+                        Ok(_) => set_cwd(&resolved),
+                        Err(e) => crate::console::write_str(&format!("cd FAILED: {e}\n")),
+                    }
+                }
             } else if let Some(rest) = other.strip_prefix("write ") {
                 // MILESTONE 18: real named-file storage on the same
                 // ATA disk Milestone 11 already proved persists across
                 // a genuine reboot.
                 match rest.split_once(' ') {
-                    Some((name, text)) => match crate::fs::write_file(name, text.as_bytes()) {
-                        Ok(()) => crate::console::write_str(&format!("wrote {} bytes to '{name}'\n", text.len())),
-                        Err(e) => crate::console::write_str(&format!("write FAILED: {e}\n")),
-                    },
+                    Some((name, text)) => {
+                        let target = resolve_arg(name);
+                        match crate::fs::write_file(&target, text.as_bytes()) {
+                            Ok(()) => crate::console::write_str(&format!("wrote {} bytes to '{name}'\n", text.len())),
+                            Err(e) => crate::console::write_str(&format!("write FAILED: {e}\n")),
+                        }
+                    }
                     None => crate::console::write_str("usage: write NAME TEXT...\n"),
                 }
             } else if let Some(name) = other.strip_prefix("read ") {
-                match crate::fs::read_file(name.trim()) {
+                let target = resolve_arg(name.trim());
+                match crate::fs::read_file(&target) {
                     Ok(data) => {
                         let text = String::from_utf8_lossy(&data);
                         crate::console::write_str(&format!("{text}\n"));
@@ -343,21 +509,44 @@ fn run_command(cmd: &str) {
                 // AND its allocated data-pool sectors, so they're
                 // genuinely available to a later write, not just
                 // hidden from ls forever.
-                match crate::fs::delete_file(name.trim()) {
+                let target = resolve_arg(name.trim());
+                match crate::fs::delete_file(&target) {
                     Ok(()) => crate::console::write_str(&format!("removed '{}'\n", name.trim())),
                     Err(e) => crate::console::write_str(&format!("rm FAILED: {e}\n")),
+                }
+            } else if let Some(name) = other.strip_prefix("rmdir ") {
+                // MILESTONE 32: real rmdir -- refuses on a non-empty
+                // directory (fs::remove_dir's own real check), and the
+                // shell additionally refuses to remove CWD itself
+                // (comparing resolved, root-relative paths) since
+                // fs.rs has no notion of "the shell's current
+                // directory" to protect that invariant on its own --
+                // succeeding would leave CWD pointing at sectors that
+                // were just freed back into the pool.
+                let target = resolve_arg(name.trim());
+                if target == cwd_path() {
+                    crate::console::write_str("rmdir FAILED: cannot remove the current directory\n");
+                } else {
+                    match crate::fs::remove_dir(&target) {
+                        Ok(()) => crate::console::write_str(&format!("removed directory '{}'\n", name.trim())),
+                        Err(e) => crate::console::write_str(&format!("rmdir FAILED: {e}\n")),
+                    }
                 }
             } else if let Some(name) = other.strip_prefix("mkdir ") {
                 // MILESTONE 28: creates a real subdirectory -- its own
                 // one-sector entry table allocated from the same pool
                 // files use (see fs.rs doc comment for the full design
-                // and its honest limits).
-                match crate::fs::make_dir(name.trim()) {
+                // and its honest limits). MILESTONE 32: no longer
+                // restricted to directly under root -- resolved against
+                // CWD like every other path argument now.
+                let target = resolve_arg(name.trim());
+                match crate::fs::make_dir(&target) {
                     Ok(()) => crate::console::write_str(&format!("created directory '{}'\n", name.trim())),
                     Err(e) => crate::console::write_str(&format!("mkdir FAILED: {e}\n")),
                 }
             } else if let Some(dir) = other.strip_prefix("ls ") {
-                print_listing(crate::fs::list(Some(dir.trim())));
+                let target = resolve_arg(dir.trim());
+                print_listing(crate::fs::list(Some(&target)));
             } else if let Some(rest) = other.strip_prefix("kill ") {
                 // MILESTONE 25: terminates a live task for real -- its
                 // stack gets freed (immediately, or deferred until it's
@@ -381,15 +570,56 @@ fn run_command(cmd: &str) {
                 // process::init_test_processes) rather than the
                 // kernel's shared page tables `usertest` still uses --
                 // real per-process isolation, not just a second
-                // hardcoded program.
+                // hardcoded program. MILESTONE 33: the program it runs
+                // now also calls the sbrk syscall against its own
+                // private per-process heap before writing/exiting --
+                // see serial log for the heap marker byte proof.
                 match rest.trim().parse::<u8>() {
                     Ok(id) => match crate::process::run(id) {
                         Ok(()) => crate::console::write_str(&format!(
-                            "runproc {id}: entered ring 3 under its own private page table, ran print+exit syscalls, returned cleanly -- see serial log for its message + hardware CPL confirmation\n"
+                            "runproc {id}: entered ring 3 under its own private page table, ran sbrk+write+exit syscalls, returned cleanly -- see serial log for its message + private heap marker + hardware CPL confirmation\n"
                         )),
                         Err(e) => crate::console::write_str(&format!("runproc FAILED: {e}\n")),
                     },
                     Err(_) => crate::console::write_str("usage: runproc ID (1 or 2)\n"),
+                }
+            } else if let Some(path) = other.strip_prefix("runfile ") {
+                // MILESTONE 34: real general program loader -- reads
+                // `path`'s bytes off the actual on-disk filesystem
+                // (fs.rs) and runs them under a fresh private PML4 via
+                // process::create_loaded_process()/run_loaded_process()
+                // (MILESTONE 35: split from one original
+                // load_and_run_image() to fix a real bug -- see
+                // run_loaded_process()'s own doc comment), the same
+                // page-table mechanism Milestone 30 built for
+                // PROCESS_A/PROCESS_B, just fed from a real file read
+                // instead of a compiled-in array.
+                match crate::loader::run_file(path.trim()) {
+                    Ok(()) => crate::console::write_str(
+                        "runfile: loaded from disk and ran under its own private page table -- write+exit syscalls returned cleanly, see serial log for the message it printed (proof it came from the file) + hardware CPL confirmation\n",
+                    ),
+                    Err(e) => crate::console::write_str(&format!("{e}\n")),
+                }
+            } else if let Some(path) = other.strip_prefix("runelf ") {
+                // MILESTONE 36: real ELF64 loader -- reads `path`'s
+                // bytes off the actual on-disk filesystem (same as
+                // `runfile` above), genuinely PARSES them as ELF64
+                // (kernel/src/elf.rs -- real magic/e_type/e_machine
+                // validation, real program header table walk, real
+                // PT_LOAD segment extraction) instead of assuming
+                // they're already flat code at offset 0, then maps each
+                // PT_LOAD segment at its own real p_vaddr and runs the
+                // ELF's own e_entry under a fresh private PML4 (see
+                // process::create_process_from_elf() for this
+                // milestone's honest scoping decision: e_entry must
+                // equal USER_CODE_ADDR exactly, since the ring-3 entry
+                // trampoline's jump target was deliberately kept fixed
+                // rather than made dynamic this milestone).
+                match crate::loader::run_elf(path.trim()) {
+                    Ok(()) => crate::console::write_str(
+                        "runelf: parsed a REAL ELF64 file, mapped its PT_LOAD segments at their own vaddrs, and ran it under its own private page table -- write+exit syscalls returned cleanly, see serial log for the parsed e_entry/segments + the message it printed (proof execution reached a non-zero-offset segment) + hardware CPL confirmation\n",
+                    ),
+                    Err(e) => crate::console::write_str(&format!("{e}\n")),
                 }
             } else if let Some(rest) = other.strip_prefix("pixel ") {
                 match parse_usize_args::<2>(rest) {

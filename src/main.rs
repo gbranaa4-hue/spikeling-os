@@ -38,6 +38,17 @@ fn main() {
     // exit_qemu() in kernel/src/main.rs)
     cmd.arg("-device")
         .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");
+    // MILESTONE 33: an additional QEMU human-monitor instance on a fixed
+    // TCP port, alongside (not replacing) the existing `-serial
+    // mon:stdio` monitor -- lets test tooling drive `sendkey`/`quit`
+    // over a plain socket independently of whatever is/isn't attached to
+    // this process's own stdio. Opt-in via an env var, unset by default,
+    // so ordinary `cargo run` (every other milestone's workflow) is
+    // completely unaffected.
+    if let Ok(port) = env::var("SPIKELING_QEMU_MONITOR_PORT") {
+        cmd.arg("-monitor")
+            .arg(format!("tcp:127.0.0.1:{port},server,nowait"));
+    }
 
     if uefi {
         let prebuilt =

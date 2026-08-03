@@ -134,6 +134,45 @@ static TOTAL_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEMO_ACTIVE: AtomicBool = AtomicBool::new(false); // bounded Milestone 5c window only
 static BACKGROUND: AtomicBool = AtomicBool::new(false); // MILESTONE 25: perpetual post-boot scheduling
 
+/// BUGFIX (found while root-causing the Milestone 36 disclosed ELF-loader
+/// page fault): usertest.rs's ring-3 excursions (usertest/runproc/
+/// runfile/runelf, ALL funneled through enter_ring3()/enter_ring3_now())
+/// run with interrupts enabled, deliberately, so the excursion's own
+/// syscalls work -- but that means a background-scheduler timer tick
+/// CAN legitimately fire while nested deep inside one, with CURRENT ==
+/// usize::MAX ("kernel_main/shell is running"). If the scheduler then
+/// picks a different task, timer_tick_switch() below calls switch_to()
+/// on THAT nested, mid-excursion rsp -- which stomps THIS module's own
+/// KERNEL_RSP (a completely different static than usertest.rs's own
+/// same-named KERNEL_RSP, despite sharing a name) with a stack pointer
+/// sitting mid-excursion, and a later scheduler switch back to
+/// "kernel_main" resumes it via switch_to()'s callee-saved-register
+/// convention -- a protocol mismatch with resume_kernel()'s actual
+/// int-0x80-return convention, corrupting execution once it unwinds.
+/// This is the SAME general failure class the earlier, already-fixed
+/// `sti`-in-resume_kernel bug was (a nested timer tick hijacking
+/// execution mid-call-chain) -- just triggered here by the excursion's
+/// OWN interrupts-enabled design (a real, disclosed, documented
+/// limitation in usertest::run()'s own comment) rather than a premature
+/// `sti`. Fixed the same way real kernels handle this class of hazard:
+/// a real, minimal "preemption disabled" guard around exactly the
+/// excursion's duration, checked here and set/cleared by
+/// usertest::run()/enter_ring3_now() around their enter_ring3() calls.
+/// Scoped deliberately narrow -- it only skips SWITCHING a task away
+/// mid-tick, not the timer interrupt itself, so PIT-driven timing
+/// (Milestone 5b) and reap_zombies() below are unaffected.
+pub static RING3_EXCURSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// TEMPORARY DIAGNOSTIC (root-causing the Milestone 36 page fault):
+/// counts how many timer/keyboard interrupts landed WHILE
+/// RING3_EXCURSION_ACTIVE was true, to directly correlate interrupt
+/// activity during the excursion window against pass/fail -- same
+/// diagnostic style this project already used elsewhere (instrumenting
+/// Cr3::read() inside the timer handler for an earlier bug). Not meant
+/// to stay long-term.
+pub static TIMER_DURING_EXCURSION: AtomicU64 = AtomicU64::new(0);
+pub static KEYBOARD_DURING_EXCURSION: AtomicU64 = AtomicU64::new(0);
+
 extern "C" fn worker_entry_0() -> ! {
     worker_loop(0)
 }
@@ -351,6 +390,17 @@ pub fn live_tasks() -> Vec<TaskReport> {
 /// or doesn't return.
 pub fn timer_tick_switch() {
     reap_zombies();
+
+    // BUGFIX: see RING3_EXCURSION_ACTIVE's own doc comment above -- never
+    // switch a task away while a ring-3 excursion (usertest/runproc/
+    // runfile/runelf) is mid-flight; its own nested rsp is not a valid
+    // task context to save/restore through this mechanism. The timer
+    // interrupt itself still fires and returns normally (PIT timing,
+    // Milestone 5b, is unaffected) -- only the SWITCH decision is
+    // skipped for this one tick.
+    if RING3_EXCURSION_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
 
     let current = CURRENT.load(Ordering::SeqCst);
 

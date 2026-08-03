@@ -83,6 +83,9 @@ pub fn init_pics() {
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    if crate::tasks::RING3_EXCURSION_ACTIVE.load(Ordering::SeqCst) {
+        crate::tasks::TIMER_DURING_EXCURSION.fetch_add(1, Ordering::SeqCst);
+    }
     unsafe {
         // EOI first: the PIC needs to know this IRQ is acknowledged
         // before we potentially switch stacks underneath it, in case
@@ -106,6 +109,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    if crate::tasks::RING3_EXCURSION_ACTIVE.load(Ordering::SeqCst) {
+        crate::tasks::KEYBOARD_DURING_EXCURSION.fetch_add(1, Ordering::SeqCst);
+    }
     crate::keyboard::on_interrupt();
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
