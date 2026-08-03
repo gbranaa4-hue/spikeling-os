@@ -1089,6 +1089,43 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       now ruled out. `runelf`/`runfile` should both continue to be
       treated as not yet safe for repeated/rapid interactive use.
 
+      **Second round of real testing, same night:** two more things
+      checked directly rather than assumed.
+
+      1. **Confirmed the shared-bug theory directly, not just by
+         analogy**: ran the IDENTICAL automated repro (fresh boot,
+         seed -> load+run -> `about` within ~1s) against the flat-binary
+         `runfile` path instead of `runelf`. 5/8 trials failed -- the
+         same ~60-70% rate as `runelf`, with the same fault character
+         (RIP and RSP both landing in/near the heap region,
+         `0x444444...`). This is real, direct proof `runfile` and
+         `runelf` share the identical underlying bug, not two similar-
+         looking but separate ones.
+      2. **Tested and REFUTED heap exhaustion/fragmentation as the
+         mechanism**: `network.rs`'s `tick()` allocates+frees a `fired:
+         Vec` on every timer tick any neuron fires, running continuously
+         in the background (Milestone 25) for the whole ~25-30s boot-to-
+         shell window before either repro command ever runs, on a heap
+         explicitly disclosed as "small on purpose for milestone 3...
+         not sized for real workloads yet" (100 KiB, `allocator.rs`) --
+         a real, plausible mechanism for `linked_list_allocator`
+         free-list pressure. Bumped `HEAP_SIZE` 10x (1 MiB) and re-ran 10
+         real trials: still failed 6/10 times, statistically
+         indistinguishable from the 100 KiB rate. Reverted the change --
+         heap SIZE is not the mechanism either.
+
+      Two real hypotheses (scheduler-preemption, heap-size pressure) now
+      directly refuted by measurement, not two guesses abandoned on a
+      hunch. What's confirmed: it's one shared bug across both loaded-
+      process paths, character consistent with heap-allocator corruption
+      (not a stray one-off crash), independent of interrupt timing and
+      independent of available heap headroom. That points more
+      specifically at `linked_list_allocator`'s own internal logic, or a
+      genuine memory-safety bug (use-after-free, double-free, or bad
+      pointer arithmetic) in the `create_process_from_elf`/
+      `create_process_from_image`/`Process` `Drop` path specifically --
+      the next real lead to chase, not the two already closed off above.
+
       Built in an isolated
       parallel-agent workspace, then hand-merged alongside the
       concurrently-built Milestone 35 above -- both milestones extended
