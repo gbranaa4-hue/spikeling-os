@@ -412,6 +412,29 @@ pub fn seed_test_elf() -> Result<usize, String> {
     Ok(len)
 }
 
+/// MILESTONE 39: a real, externally-built ELF64 executable using this
+/// project's OWN minimal libc (tools/libc_test_src/libc.rs) instead of
+/// hand-assembled `int 0x80` machine code -- the first user program that
+/// calls write()/sbrk()/fork()/wait()/exit() as ordinary Rust function
+/// calls. Built with the same pinned nightly toolchain as testelf.elf
+/// (see tools/libc_test_src/README.md for the exact recipe and why this
+/// one needed `--gc-sections`/`relocation-model=static` that testelf's
+/// own recipe didn't).
+static LIBCTEST_ELF_BYTES: &[u8] = include_bytes!("../assets/libctest.elf");
+
+/// MILESTONE 39: writes LIBCTEST_ELF_BYTES to a real file ("libctest")
+/// on the real on-disk filesystem -- the `seedlibctest` shell command's
+/// entry point, mirroring seed_test_elf()'s own reasoning exactly.
+pub fn seed_libc_test() -> Result<usize, String> {
+    let len = LIBCTEST_ELF_BYTES.len();
+    fs::write_file("libctest", LIBCTEST_ELF_BYTES).map_err(|e| format!("seedlibctest: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 39: seedlibctest -- wrote {len} real bytes (an ELF64 executable built against this project's own minimal libc, not hand-assembled) to 'libctest' on the real on-disk filesystem"
+    );
+    Ok(len)
+}
+
 /// MILESTONE 36: the `runelf PATH` shell command's entry point. Reads
 /// `path`'s bytes off the real on-disk filesystem (same fs::read_file()
 /// `runfile` uses above), parses them for real as ELF64 via elf::parse()

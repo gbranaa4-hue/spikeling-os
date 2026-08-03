@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, background, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork\n",
+            "commands: help, about, tasks, background, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedlibctest\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -464,6 +464,22 @@ fn run_command(cmd: &str) {
                     "seedtestelf: wrote {len} real bytes to 'testelf' on disk (a genuine ELF64 executable, not hand-assembled) -- try 'runelf testelf'\n"
                 )),
                 Err(e) => crate::console::write_str(&format!("seedtestelf FAILED: {e}\n")),
+            }
+        }
+        "seedlibctest" => {
+            // MILESTONE 39: writes this milestone's real ELF64 test
+            // executable, built against this project's OWN minimal libc
+            // (tools/libc_test_src/libc.rs) -- the first user program
+            // that calls write()/sbrk()/fork()/wait()/exit() as ordinary
+            // Rust function calls instead of hand-assembled `int 0x80`
+            // sequences. Run with 'runelf libctest' (same command
+            // Milestone 36's ELF loader already provides -- no new
+            // "run" path needed, this is just another real ELF file).
+            match crate::loader::seed_libc_test() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedlibctest: wrote {len} real bytes to 'libctest' on disk (built against this project's own minimal libc) -- try 'runelf libctest'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedlibctest FAILED: {e}\n")),
             }
         }
         "clear" => crate::console::clear_screen(),
