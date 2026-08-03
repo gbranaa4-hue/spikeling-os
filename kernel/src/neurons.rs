@@ -8,6 +8,19 @@
 //! synapses. MILESTONE 11: learned weights persisted to disk (ata.rs)
 //! across a real reboot.
 //!
+//! MILESTONE 38: persistence generalized from two hardcoded f32s to
+//! network.rs's REAL, arbitrary synapse list (network.rs's
+//! all_synapse_weights()/apply_synapse_weight()), and each weight is
+//! now ternary-packed on disk (ternary.rs) instead of raw f32 -- see
+//! ata.rs's module doc for the on-disk format and the honest scoping
+//! decision (weights generalize; network TOPOLOGY still does not
+//! persist, so only LeftKey->Motor/RightKey->Motor -- seeded again
+//! every boot regardless -- are guaranteed to exist to receive a
+//! loaded weight at boot time). The LIVE, actively-learning weights
+//! (network.rs's Synapse.weight: f32, trained by apply_stdp) are
+//! completely untouched by any of this -- ternary quantization applies
+//! ONLY at the save/load disk boundary, never during STDP.
+//!
 //! MILESTONE 21: this file no longer holds ANY neuron/synapse state of
 //! its own. It used to own a completely separate LifNeuron/Network
 //! struct pair, its own copy of the STDP formula, and its own tick(),
@@ -31,6 +44,8 @@
 
 use alloc::format;
 use alloc::string::String;
+use core::fmt::Write;
+use crate::serial;
 
 pub const LEFT_KEY: &str = "LeftKey";
 pub const RIGHT_KEY: &str = "RightKey";
@@ -44,16 +59,23 @@ const REFRACTORY_TICKS: u32 = 7; // ~400ms at the default ~18.2Hz PIT rate -- un
 const INITIAL_WEIGHT: f32 = 0.5; // neutral starting point -- unchanged since Milestone 10
 const KEY_STIM_AMOUNT: f32 = 120.0; // unchanged since Milestone 9
 
+/// MILESTONE 38: how many of a saved file's entries actually matched
+/// an existing synapse at load time, out of how many the file held --
+/// see the module doc for why these can honestly differ (topology
+/// isn't persisted, only weights of synapses that already exist).
+pub struct LoadReport {
+    pub matched: usize,
+    pub total_in_file: usize,
+}
+
 /// Seeds the shared GenericNetwork (network.rs) with LeftKey, RightKey
-/// and Motor and their synapses, loading learned weights from disk
-/// (Milestone 11) if present. Returns true if weights were loaded from
-/// disk, false if the neutral defaults were used -- reported honestly
-/// by main.rs either way, same as before Milestone 21.
-pub fn init() -> bool {
-    let (left_w, right_w, loaded) = match crate::ata::load_weights() {
-        Some((l, r)) => (l, r, true),
-        None => (INITIAL_WEIGHT, INITIAL_WEIGHT, false),
-    };
+/// and Motor and their synapses at the Milestone 10 neutral defaults,
+/// THEN tries loading a saved, ternary-packed, name-keyed weight list
+/// from disk (Milestone 11/38) and applies any entries that match a
+/// synapse that now exists. Returns None if no (recognizable) saved
+/// file was found -- reported honestly by main.rs either way, same
+/// discipline as before Milestone 21/38.
+pub fn init() -> Option<LoadReport> {
     crate::network::seed_fixed_network(
         LEFT_KEY,
         RIGHT_KEY,
@@ -63,10 +85,18 @@ pub fn init() -> bool {
         MOTOR_THRESHOLD,
         MOTOR_LEAK,
         REFRACTORY_TICKS,
-        left_w,
-        right_w,
+        INITIAL_WEIGHT,
+        INITIAL_WEIGHT,
     );
-    loaded
+    let entries = crate::ata::load_weights()?;
+    let total_in_file = entries.len();
+    let mut matched = 0;
+    for (from, to, w) in &entries {
+        if crate::network::apply_synapse_weight(from, to, *w) {
+            matched += 1;
+        }
+    }
+    Some(LoadReport { matched, total_in_file })
 }
 
 /// Called from keyboard.rs -- 'a' stimulates LeftKey, 'd' stimulates
@@ -85,13 +115,29 @@ pub fn on_key_stimulus(c: char) {
     }
 }
 
-/// MILESTONE 11: writes the current learned weights to the dedicated
-/// persistence disk (ata.rs), so they survive a real reboot -- sourced
-/// from the shared network's live synapse weights, not a separate copy.
+/// MILESTONE 11/38: writes the CURRENT, REAL synapse list (whatever
+/// exists right now -- the two fixed synapses plus any `addsynapse`
+/// ones, generalized from Milestone 11's hardcoded pair via
+/// network.rs::all_synapse_weights()) to the dedicated persistence
+/// disk (ata.rs), ternary-packed. Logs the real, computed size
+/// comparison (packed bytes actually written vs. the equivalent f32
+/// size) to serial, the same discipline OBSERVE's own build process
+/// uses to report its real compression ratio -- not an assumed number.
 pub fn save_weights_to_disk() -> Result<(), &'static str> {
-    let left = crate::network::synapse_weight(LEFT_KEY, MOTOR).ok_or("network not initialized")?;
-    let right = crate::network::synapse_weight(RIGHT_KEY, MOTOR).ok_or("network not initialized")?;
-    crate::ata::save_weights(left, right)
+    let entries = crate::network::all_synapse_weights();
+    if entries.is_empty() {
+        return Err("network not initialized");
+    }
+    crate::ata::save_weights(&entries)?;
+    let n = entries.len();
+    let packed_bytes = n * crate::ternary::PACKED_BYTES_PER_WEIGHT;
+    let f32_bytes = n * 4;
+    let _ = writeln!(
+        serial(),
+        "milestone 38: saved {n} synapse weight(s) -- {packed_bytes} ternary-packed bytes vs {f32_bytes} equivalent f32 bytes ({:.2}x smaller per weight)",
+        f32_bytes as f32 / packed_bytes as f32
+    );
+    Ok(())
 }
 
 pub fn left_to_motor_weight() -> f32 {

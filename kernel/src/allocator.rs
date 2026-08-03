@@ -12,18 +12,6 @@ use x86_64::{
 };
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-// TESTED AND REFUTED (root-causing the Milestone 36 disclosed page
-// fault): tried bumping this 10x (100 KiB -> 1 MiB) on the theory that
-// heap exhaustion/fragmentation pressure -- from network.rs's tick()
-// allocating+freeing a `fired: Vec` on every timer tick any neuron
-// fires, running continuously in the background (Milestone 25) the
-// entire time the shell sits idle -- was the real mechanism behind the
-// disclosed runfile/runelf page fault. Reverted: 10 repeated real trials
-// at 1 MiB still failed 6/10 times, statistically indistinguishable from
-// the ~60-70% rate at 100 KiB. Heap SIZE is not the mechanism. See
-// README.md's Milestone 36 entry for the full, still-open investigation
-// (scheduler-preemption also directly refuted; both real, honest
-// negative results, not guesses).
 pub const HEAP_SIZE: usize = 100 * 1024; // 100 KiB -- small on purpose for
 // milestone 3; the point here is proving map+alloc actually work end to
 // end, not sizing for real workloads yet.

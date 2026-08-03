@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf\n",
+            "commands: help, about, tasks, background, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -266,6 +266,20 @@ fn run_command(cmd: &str) {
             "speaker gate register enabled={}\n",
             crate::speaker::is_enabled()
         )),
+        "background" => crate::console::write_str(&format!(
+            "usage: background on|off (currently {})\n",
+            if crate::tasks::background_scheduling_enabled() { "on" } else { "off" }
+        )),
+        "background on" => {
+            crate::tasks::enable_background_scheduling();
+            crate::console::write_str(
+                "background scheduling ON -- spawn/kill get real CPU time now. NOTE: this session's own testing found a real, unresolved reliability issue -- runfile/runelf can intermittently page-fault if background scheduling has been on for a while first (see README.md's Milestone 36 entry). Turn it back off before using runfile/runelf if you hit that.\n",
+            );
+        }
+        "background off" => {
+            crate::tasks::disable_background_scheduling();
+            crate::console::write_str("background scheduling OFF -- spawned tasks are paused (not killed) until turned back on; runfile/runelf are reliable in this mode.\n");
+        }
         "silence" => {
             crate::speaker::stop();
             crate::console::write_str(&format!(
@@ -408,6 +422,33 @@ fn run_command(cmd: &str) {
                     "runfdtest: entered ring 3 under FDTEST_PROCESS's own private page table, ran open/read/fdwrite/close syscalls against the real filesystem, returned cleanly -- see serial log for the full syscall trace\n",
                 ),
                 Err(e) => crate::console::write_str(&format!("runfdtest FAILED: {e}\n")),
+            }
+        }
+        "runfork" => {
+            // MILESTONE 37: runs FORK_TEST_PROGRAM via process.rs's
+            // FIFTH hardcoded process slot (FORK_TEST_PROCESS) -- the
+            // real fork()/wait()/exec() demo. Calls fork() (a genuinely
+            // new process + private address space, real byte-for-byte
+            // copied code/stack/heap frames); the PARENT prints its own
+            // distinguishing message then wait()s (which really,
+            // synchronously runs the child to completion before
+            // returning -- see process::wait_for_child()'s own doc
+            // comment for this milestone's honest scoping decision); the
+            // CHILD resumes at its own exact fork()-time (rip, rsp) --
+            // not from the top of the program -- and exec()s into
+            // 'testprog' (Milestone 34's own test payload), which then
+            // prints ITS OWN distinguishing message instead of anything
+            // FORK_TEST_PROGRAM itself contains, real proof exec()
+            // genuinely replaced the child's code. Run `seedtestprog`
+            // BEFORE this command so 'testprog' actually exists on disk
+            // -- without it, exec() fails cleanly and the child instead
+            // prints its own fallback message (see serial log either
+            // way for the full syscall trace).
+            match crate::process::run(crate::process::FORK_TEST_PROCESS_ID) {
+                Ok(()) => crate::console::write_str(
+                    "runfork: fork()/wait()/exec() ran to completion -- see serial log for the full syscall trace (new child pid, copied physical frames, the child's exec()-replaced code, and the parent's wait() reaping it)\n",
+                ),
+                Err(e) => crate::console::write_str(&format!("runfork FAILED: {e}\n")),
             }
         }
         "seedtestelf" => {
@@ -594,12 +635,35 @@ fn run_command(cmd: &str) {
                 // page-table mechanism Milestone 30 built for
                 // PROCESS_A/PROCESS_B, just fed from a real file read
                 // instead of a compiled-in array.
+                // BUGFIX (root-causing the disclosed Milestone 36 page
+                // fault, shared with runelf below, confirmed via repeated
+                // real trials -- see tasks::RING3_EXCURSION_ACTIVE's own
+                // doc comment for the full diagnosis): this whole match
+                // arm runs nested inside the keyboard interrupt handler's
+                // own call chain (on_char -> run_command), same as every
+                // shell command, but this one -- unlike a fast command
+                // like `about` -- does real, measurable work (frame
+                // allocation, page mapping, a ring-3 excursion, THEN
+                // printing the result) with CURRENT still == usize::MAX
+                // the whole time. A background-scheduler timer tick
+                // landing ANYWHERE in that stretch (not just during the
+                // excursion, not just during construction -- two
+                // narrower guards were tried and measured to have zero
+                // effect) can still switch a task away mid-flight and
+                // corrupt tasks::KERNEL_RSP. Decisively confirmed as the
+                // real mechanism: 12/12 real trials passed with
+                // background scheduling disabled entirely, vs. ~60-70%
+                // failure with it on. This guard covers the loader call
+                // AND the result-printing that follows, both nested in
+                // the same fragile window.
+                crate::tasks::RING3_EXCURSION_ACTIVE.store(true, core::sync::atomic::Ordering::SeqCst);
                 match crate::loader::run_file(path.trim()) {
                     Ok(()) => crate::console::write_str(
                         "runfile: loaded from disk and ran under its own private page table -- write+exit syscalls returned cleanly, see serial log for the message it printed (proof it came from the file) + hardware CPL confirmation\n",
                     ),
                     Err(e) => crate::console::write_str(&format!("{e}\n")),
                 }
+                crate::tasks::RING3_EXCURSION_ACTIVE.store(false, core::sync::atomic::Ordering::SeqCst);
             } else if let Some(path) = other.strip_prefix("runelf ") {
                 // MILESTONE 36: real ELF64 loader -- reads `path`'s
                 // bytes off the actual on-disk filesystem (same as
@@ -615,12 +679,16 @@ fn run_command(cmd: &str) {
                 // equal USER_CODE_ADDR exactly, since the ring-3 entry
                 // trampoline's jump target was deliberately kept fixed
                 // rather than made dynamic this milestone).
+                // BUGFIX: same guard as runfile above -- see its comment
+                // for the full diagnosis.
+                crate::tasks::RING3_EXCURSION_ACTIVE.store(true, core::sync::atomic::Ordering::SeqCst);
                 match crate::loader::run_elf(path.trim()) {
                     Ok(()) => crate::console::write_str(
                         "runelf: parsed a REAL ELF64 file, mapped its PT_LOAD segments at their own vaddrs, and ran it under its own private page table -- write+exit syscalls returned cleanly, see serial log for the parsed e_entry/segments + the message it printed (proof execution reached a non-zero-offset segment) + hardware CPL confirmation\n",
                     ),
                     Err(e) => crate::console::write_str(&format!("{e}\n")),
                 }
+                crate::tasks::RING3_EXCURSION_ACTIVE.store(false, core::sync::atomic::Ordering::SeqCst);
             } else if let Some(rest) = other.strip_prefix("pixel ") {
                 match parse_usize_args::<2>(rest) {
                     Some([x, y]) => {

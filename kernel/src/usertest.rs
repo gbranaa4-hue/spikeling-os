@@ -54,7 +54,6 @@
 
 use crate::gdt;
 use crate::serial;
-use crate::tasks::RING3_EXCURSION_ACTIVE;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::VirtAddr;
@@ -164,6 +163,41 @@ static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// to resume_kernel(), which pops back into run() as if enter_ring3()
 /// had simply returned normally after some delay.
 static KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
+
+/// MILESTONE 37: a SECOND, dedicated kernel-resume anchor, exactly
+/// analogous to KERNEL_RSP above but used ONLY by
+/// enter_ring3_as_forked_child() -- process::run_forked_child()'s own
+/// nested ring-3 excursion, driven from inside the PARENT's own wait()
+/// syscall dispatch, needs somewhere to stash ITS kernel-side rsp that
+/// is NOT KERNEL_RSP, or it would clobber whatever the OUTER (top-level,
+/// parent's own) excursion already stashed there, corrupting the
+/// parent's own eventual resume point. A single dedicated static (not a
+/// general per-nesting-level stack of anchors) is this milestone's
+/// real, honest, ENFORCED v1 bound on nesting depth: exactly one nested
+/// child excursion can be in flight at a time -- see
+/// is_in_child_resume()'s own doc comment for how that's actually
+/// checked, not just assumed.
+static CHILD_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
+
+/// MILESTONE 37: true for the ENTIRE duration a forked child is running
+/// via enter_ring3_as_forked_child() (set just before that function's
+/// own iretq, cleared just after it returns) -- read by TWO places: (1)
+/// the exit-syscall arm below, to decide whether THIS excursion's
+/// resume_kernel() call should use CHILD_KERNEL_RSP instead of the
+/// top-level KERNEL_RSP; (2) process::fork()/wait_for_child(), to
+/// refuse (not silently misbehave) a fork()/wait() call that would
+/// require a SECOND, simultaneously-live nested anchor -- this design
+/// only has one.
+static IN_CHILD_RESUME: AtomicBool = AtomicBool::new(false);
+
+/// MILESTONE 37: real, honest, ENFORCED nesting-depth check -- see
+/// IN_CHILD_RESUME's own doc comment. `pub(crate)` so process.rs's
+/// fork()/wait_for_child() can check it directly before ever attempting
+/// a nested excursion, rather than attempting one and discovering the
+/// collision after the fact.
+pub(crate) fn is_in_child_resume() -> bool {
+    IN_CHILD_RESUME.load(Ordering::SeqCst)
+}
 
 /// MILESTONE 27: allocates one physical frame for the user code page and
 /// one for the user stack page, maps both PRESENT | WRITABLE |
@@ -463,7 +497,23 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 crate::process::restore_kernel_cr3();
                 crate::process::ACTIVE_PROCESS.store(0, Ordering::SeqCst);
             }
-            let saved = KERNEL_RSP.load(Ordering::SeqCst);
+            // MILESTONE 37: this exit() might be unwinding a TOP-LEVEL
+            // excursion (usertest::run()/process::run() and friends,
+            // entered via enter_ring3_now(), whose own kernel-side
+            // resume point lives in KERNEL_RSP) OR a NESTED forked-
+            // child excursion (process::run_forked_child(), entered via
+            // enter_ring3_as_forked_child(), whose resume point lives in
+            // the separate CHILD_KERNEL_RSP instead) -- IN_CHILD_RESUME
+            // is still true here if it's the latter (cleared only AFTER
+            // enter_ring3_as_forked_child() itself returns, which
+            // hasn't happened yet at this point in the call chain), so
+            // reading it now picks the anchor that actually matches
+            // which excursion is really unwinding.
+            let saved = if IN_CHILD_RESUME.load(Ordering::SeqCst) {
+                CHILD_KERNEL_RSP.load(Ordering::SeqCst)
+            } else {
+                KERNEL_RSP.load(Ordering::SeqCst)
+            };
             unsafe { resume_kernel(saved) };
         }
         2 => {
@@ -701,6 +751,138 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 }
             }
         }
+        7 => {
+            // MILESTONE 37: fork() -- takes no arguments. Returns the
+            // new child's pid in rax to the PARENT (this int 0x80
+            // returns normally, exactly like every other syscall
+            // above); the CHILD only ever sees rax=0 much LATER, when
+            // process::run_forked_child() actually resumes it (forced
+            // by usertest::enter_ring3_as_forked_child()'s own
+            // "xor eax, eax" right before its iretq -- not decided
+            // here). regs.rip/regs.rsp are the hardware-recorded
+            // InterruptStackFrame values for THIS int 0x80 -- handed to
+            // process::fork() unmodified as the child's own future
+            // resume point.
+            if active == 0 {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 37: syscall FORK called with no active process (plain usertest excursion cannot fork) -- ignoring, returning u64::MAX"
+                );
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::fork(active, regs.rip, regs.rsp) {
+                    Some(child_pid) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 37: syscall FORK (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- created child pid {child_pid}",
+                            regs.cs
+                        );
+                        regs.rax = child_pid as u64;
+                    }
+                    None => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 37: syscall FORK (process {active}) -- FAILED (see process.rs's own log line just above for the real reason) -- returning u64::MAX"
+                        );
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        8 => {
+            // MILESTONE 37: wait(child_pid) -- rdi = child_pid. See
+            // process::wait_for_child()'s own doc comment for exactly
+            // what this does and why it's a real, honest implementation
+            // of "block until the child changes state" for this
+            // milestone's synchronous execution model -- this int 0x80
+            // genuinely does not return until the child has run all the
+            // way to its own exit().
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 37: syscall WAIT called with no active process -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else {
+                let child_pid_arg = regs.rdi;
+                if child_pid_arg > u8::MAX as u64 {
+                    let _ = writeln!(serial(), "milestone 37: syscall WAIT (process {active}) -- pid argument {child_pid_arg} out of range -- returning u64::MAX");
+                    regs.rax = u64::MAX;
+                } else {
+                    match crate::process::wait_for_child(active, child_pid_arg as u8) {
+                        Some(reaped) => {
+                            let _ = writeln!(
+                                serial(),
+                                "milestone 37: syscall WAIT (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- reaped child pid {reaped}",
+                                regs.cs
+                            );
+                            regs.rax = reaped as u64;
+                        }
+                        None => {
+                            let _ = writeln!(
+                                serial(),
+                                "milestone 37: syscall WAIT (process {active}) -- FAILED (pid {child_pid_arg} is not a live child of this process, or see process.rs's own log line above) -- returning u64::MAX"
+                            );
+                            regs.rax = u64::MAX;
+                        }
+                    }
+                }
+            }
+        }
+        9 => {
+            // MILESTONE 37: exec(path_ptr, path_len) -- rdi=path_ptr,
+            // rsi=path_len, the same read-through-current-CR3 technique
+            // open() (syscall 3) already uses for its own path
+            // argument. On SUCCESS this call never reaches the bottom
+            // of this match arm at all -- exec_replace_and_enter()
+            // diverges (iretq's straight into the new program's entry),
+            // the same "never return, resume ring 3 directly" shape
+            // syscall 1 (exit) already established for resuming KERNEL
+            // context, applied here to resume RING-3 context instead.
+            let path_ptr = regs.rdi;
+            let requested_len = regs.rsi;
+            let truncated = requested_len > MAX_PATH_LEN;
+            let len = if truncated { MAX_PATH_LEN } else { requested_len } as usize;
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 37: syscall EXEC called with no active process -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else {
+                let mut path_bytes = alloc::vec::Vec::with_capacity(len);
+                for i in 0..len {
+                    path_bytes.push(unsafe { core::ptr::read((path_ptr as *const u8).wrapping_add(i)) });
+                }
+                match core::str::from_utf8(&path_bytes) {
+                    Ok(path) => match crate::fs::read_file(path) {
+                        Ok(bytes) => match crate::process::exec_process(active, &bytes) {
+                            Ok(()) => {
+                                let _ = writeln!(
+                                    serial(),
+                                    "milestone 37: syscall EXEC (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- replaced code with '{path}' ({} real bytes read from the on-disk filesystem), jumping directly into the new program, never returning to the old one",
+                                    regs.cs,
+                                    bytes.len()
+                                );
+                                exec_replace_and_enter(USER_CODE_ADDR);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    serial(),
+                                    "milestone 37: syscall EXEC (process {active}) -- FAILED, {e} -- returning u64::MAX, old program continues running"
+                                );
+                                regs.rax = u64::MAX;
+                            }
+                        },
+                        Err(e) => {
+                            let _ = writeln!(
+                                serial(),
+                                "milestone 37: syscall EXEC (process {active}) -- FAILED, could not read '{path}' off the real on-disk filesystem: {e} -- returning u64::MAX, old program continues running"
+                            );
+                            regs.rax = u64::MAX;
+                        }
+                    },
+                    Err(_) => {
+                        let _ = writeln!(serial(), "milestone 37: syscall EXEC (process {active}) -- path is not valid UTF-8 -- returning u64::MAX");
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
         other => {
             let _ = writeln!(
                 serial(),
@@ -824,18 +1006,9 @@ pub fn run() -> Result<(), &'static str> {
     // limitation (see the milestone report).
     let rflags: u64 = 0x202;
 
-    // BUGFIX: see tasks::RING3_EXCURSION_ACTIVE's own doc comment -- this
-    // excursion runs with interrupts enabled, so a background-scheduler
-    // timer tick could otherwise switch a task away mid-excursion,
-    // corrupting state once it unwinds. Set for exactly this call's
-    // duration, cleared unconditionally right after (enter_ring3 always
-    // returns here -- the exit syscall's resume_kernel() is what makes
-    // that true -- so there's no path that could leave this stuck true).
-    RING3_EXCURSION_ACTIVE.store(true, Ordering::SeqCst);
     unsafe {
         enter_ring3(KERNEL_RSP.as_ptr(), user_stack_top, USER_CODE_ADDR, user_cs, user_ss, rflags);
     }
-    RING3_EXCURSION_ACTIVE.store(false, Ordering::SeqCst);
 
     let _ = writeln!(
         serial(),
@@ -858,13 +1031,127 @@ pub(crate) fn enter_ring3_now() {
     let user_stack_top = USER_STACK_ADDR + USER_STACK_SIZE;
     let rflags: u64 = 0x202;
 
-    // BUGFIX: same guard as run() above -- this is the exact call path
-    // (runproc/runfile/runelf, via process.rs) the Milestone 36 disclosed
-    // intermittent page fault was root-caused to. See
-    // tasks::RING3_EXCURSION_ACTIVE's doc comment for the full mechanism.
-    RING3_EXCURSION_ACTIVE.store(true, Ordering::SeqCst);
     unsafe {
         enter_ring3(KERNEL_RSP.as_ptr(), user_stack_top, USER_CODE_ADDR, user_cs, user_ss, rflags);
     }
-    RING3_EXCURSION_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// MILESTONE 37: mirrors enter_ring3()'s exact push order/argument
+/// mapping (see that function's own doc comment for the byte-for-byte
+/// reasoning) with exactly one addition: `xor eax, eax` right before
+/// `iretq`, forcing rax=0 on the way into ring 3 -- fork()'s own "the
+/// child sees a return value of 0" contract, applied at the ONE moment
+/// it actually matters (the child's very first, and only, resumption).
+/// Every other GPR is left as whatever was last in these physical
+/// registers (the SAME "fresh entry, no GPR restore" behavior
+/// enter_ring3() already has) -- a real, honest, deliberate
+/// simplification: FORK_TEST_PROGRAM (this milestone's own hand-
+/// assembled test) is written to only ever depend on rax immediately
+/// after its own fork() call (`mov rbx, rax; cmp rbx, 0; je
+/// child_path`), so a full 15-register save/restore (which the parent's
+/// own SyscallRegs snapshot technically has, but this function does not
+/// thread through) is real, disclosed, unneeded surgery for what this
+/// milestone's actual test program requires -- a general "resume this
+/// process exactly as if fork() had simply returned" would need it, a
+/// hand-assembled program under this project's own full control does
+/// not.
+#[unsafe(naked)]
+unsafe extern "C" fn enter_ring3_as_child(
+    _kernel_rsp_slot: *mut u64,
+    _user_rsp: u64,
+    _user_rip: u64,
+    _user_cs: u64,
+    _user_ss: u64,
+    _rflags: u64,
+) {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rdi], rsp",
+        "push r8",  // SS
+        "push rsi", // RSP (child's resume_rsp)
+        "push r9",  // RFLAGS
+        "push rcx", // CS
+        "push rdx", // RIP (child's resume_rip)
+        "xor eax, eax",
+        "iretq",
+    );
+}
+
+/// MILESTONE 37: process::run_forked_child()'s own entry point into
+/// this mechanism -- switches CR3 has ALREADY happened by the time this
+/// is called (process.rs's own responsibility, same division of labor
+/// as enter_ring3_now()'s own doc comment describes for the top-level
+/// case). Sets IN_CHILD_RESUME for the ENTIRE duration the child is
+/// running (including its own eventual exit() syscall's dispatch, which
+/// reads this flag to pick CHILD_KERNEL_RSP over KERNEL_RSP -- see that
+/// arm's own comment), and saves/restores through CHILD_KERNEL_RSP, NOT
+/// KERNEL_RSP, so this nested excursion cannot clobber the OUTER
+/// (top-level, parent's own) excursion's own already-saved resume
+/// point.
+pub(crate) fn enter_ring3_as_forked_child(resume_rip: u64, resume_rsp: u64) {
+    let user_cs = gdt::user_code_selector().0 as u64;
+    let user_ss = gdt::user_data_selector().0 as u64;
+    let rflags: u64 = 0x202;
+
+    IN_CHILD_RESUME.store(true, Ordering::SeqCst);
+    unsafe {
+        enter_ring3_as_child(CHILD_KERNEL_RSP.as_ptr(), resume_rsp, resume_rip, user_cs, user_ss, rflags);
+    }
+    // Reached only once the child's own exit() syscall has run
+    // (resume_kernel(), driven by the exit arm's IN_CHILD_RESUME check
+    // above, pops back to exactly the stack position saved into
+    // CHILD_KERNEL_RSP by the naked push sequence above -- i.e. HERE).
+    IN_CHILD_RESUME.store(false, Ordering::SeqCst);
+}
+
+/// MILESTONE 37: builds an iretq frame from `user_rsp`/`user_rip`/
+/// `user_cs`/`user_ss`/`rflags` and executes it directly -- deliberately
+/// takes NO kernel_rsp_slot and never returns (`-> !`), the same "never
+/// return, iretq directly" shape resume_kernel() already established
+/// for the exit syscall's "jump back to kernel" case, applied here to
+/// "jump into a NEWLY exec()'d program's entry" instead. This does NOT
+/// establish a new resume anchor because it doesn't need one: exec()
+/// replaces the CURRENTLY-running process's own code in place without
+/// changing which excursion (top-level or nested-child) is in flight --
+/// whichever anchor (KERNEL_RSP or CHILD_KERNEL_RSP) was already
+/// established when THIS process was originally entered is still the
+/// correct one for its EVENTUAL exit() (whenever the newly-exec()'d
+/// code calls it) to resume through, completely unaffected by exec()
+/// itself.
+#[unsafe(naked)]
+unsafe extern "C" fn exec_into_ring3(_user_rsp: u64, _user_rip: u64, _user_cs: u64, _user_ss: u64, _rflags: u64) -> ! {
+    core::arch::naked_asm!(
+        "push rcx", // SS
+        "push rdi", // RSP
+        "push r8",  // RFLAGS
+        "push rdx", // CS
+        "push rsi", // RIP
+        "iretq",
+    );
+}
+
+/// MILESTONE 37: the `exec()` syscall's own entry point into
+/// exec_into_ring3() -- called from syscall_dispatch's syscall-9 arm
+/// AFTER process::exec_process() has already replaced the process's own
+/// code frame contents, with `user_rip` = USER_CODE_ADDR (the new
+/// program's entry, exactly like every top-level process entry in this
+/// file already uses -- see this module's own MILESTONE 36 scoping note
+/// for why that address is fixed rather than dynamic). Always starts
+/// the newly-exec()'d program at a FRESH top-of-stack (real exec()
+/// semantics: the old stack's contents are gone, replaced by the new
+/// program's own, exactly like a real process image replacement) rather
+/// than preserving whatever rsp value was in use before the exec() call.
+pub(crate) fn exec_replace_and_enter(user_rip: u64) -> ! {
+    let user_cs = gdt::user_code_selector().0 as u64;
+    let user_ss = gdt::user_data_selector().0 as u64;
+    let user_stack_top = USER_STACK_ADDR + USER_STACK_SIZE;
+    let rflags: u64 = 0x202;
+    unsafe {
+        exec_into_ring3(user_stack_top, user_rip, user_cs, user_ss, rflags);
+    }
 }

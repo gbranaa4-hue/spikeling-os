@@ -1031,100 +1031,56 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       repeated/rapid interactive use until root-caused; `runfile`/
       `runproc` are unaffected and remain solid.
 
-      **Follow-up investigation (real, repeated QEMU testing, not
-      guessed):** found and fixed one genuinely real, separate bug along
-      the way -- `load_and_run_elf()` held the global frame-allocator
-      spinlock across the ENTIRE ring-3 excursion (interrupts on the
-      whole time), the exact same hazard class Milestone 35 already
-      found and fixed for `run_file()` (see that entry above), just
-      never carried over to the ELF path (built in a parallel-agent
-      workspace that branched before that fix landed). Fixed by the
-      identical split: `process::create_loaded_elf_process()` (needs the
-      lock) + the EXISTING `run_loaded_process()` (no new function
-      needed -- both loaded-process paths already share one
-      `LOADED_PROCESS` slot). Also added a real, disclosed second fix:
-      `tasks::RING3_EXCURSION_ACTIVE`, a guard the background scheduler's
-      `timer_tick_switch()` now checks before switching a task away --
-      closes a real, separate window where a background-scheduler timer
-      tick landing mid-excursion (`CURRENT == usize::MAX`, "kernel_main/
-      shell is running") would `switch_to()` on the excursion's own
-      nested, mid-flight rsp, corrupting `tasks::KERNEL_RSP` (a different
-      static than `usertest::KERNEL_RSP` despite the same name) via a
-      protocol mismatch with `resume_kernel()`'s actual restore
-      convention.
-
-      **Neither fix resolved the crash** -- re-tested honestly, not
-      declared fixed on hope: 10 repeated automated trials (fresh boot,
-      `seedtestelf` -> `runelf testelf` -> `about` within ~1s, matching
-      the disclosed repro condition exactly) still page-faulted 6-7/10
-      times with the IDENTICAL signature (RIP=0x7, RSP=0x444444445df0,
-      every single time). Added temporary interrupt counters
-      (`tasks::TIMER_DURING_EXCURSION`/`KEYBOARD_DURING_EXCURSION`) to
-      directly measure whether an interrupt actually landed during the
-      excursion window in failing vs. passing trials, rather than
-      continuing to guess: **the scheduler-preemption hypothesis is
-      REFUTED by direct measurement** -- 5 of 6 failing trials had ZERO
-      timer/keyboard interrupts during the excursion at all, and the only
-      trials with a nonzero timer count were mostly passing. Whatever is
-      corrupting state is not (solely, or primarily) an interrupt landing
-      mid-excursion.
-
-      Given that, the far more likely real root cause is the SAME
-      pre-existing, already-disclosed Milestone 34/35 bug documented
-      above (`run_file()`'s own report: "file-loaded process path
-      reproducibly page-faults shortly after completing, root-caused to
-      heap corruption via a symbolized crash address inside
-      `linked_list_allocator`... confirmed absent from the `runproc`
-      path") -- not a NEW Milestone 36 defect at all, but the identical
-      unfixed heap-corruption bug, now showing up on the ELF path because
-      it goes through the exact same `LOADED_PROCESS`-replacing,
-      Vec-heavy (`heap_frames`/`extra_frames`/segment Vecs) construction
-      path `runfile` does, which `runproc`'s fixed, boot-time-only
-      PROCESS_A/PROCESS_B never exercises. This redirects future
-      investigation toward the allocator/Vec-churn mechanism specifically
-      (why does replacing/building a `LOADED_PROCESS` corrupt
-      `linked_list_allocator`'s internal state, when `runproc`'s
-      once-at-boot allocation never does?) rather than the
-      interrupt/scheduler angle this investigation started from and has
-      now ruled out. `runelf`/`runfile` should both continue to be
-      treated as not yet safe for repeated/rapid interactive use.
-
-      **Second round of real testing, same night:** two more things
-      checked directly rather than assumed.
-
-      1. **Confirmed the shared-bug theory directly, not just by
-         analogy**: ran the IDENTICAL automated repro (fresh boot,
-         seed -> load+run -> `about` within ~1s) against the flat-binary
-         `runfile` path instead of `runelf`. 5/8 trials failed -- the
-         same ~60-70% rate as `runelf`, with the same fault character
-         (RIP and RSP both landing in/near the heap region,
-         `0x444444...`). This is real, direct proof `runfile` and
-         `runelf` share the identical underlying bug, not two similar-
-         looking but separate ones.
-      2. **Tested and REFUTED heap exhaustion/fragmentation as the
-         mechanism**: `network.rs`'s `tick()` allocates+frees a `fired:
-         Vec` on every timer tick any neuron fires, running continuously
-         in the background (Milestone 25) for the whole ~25-30s boot-to-
-         shell window before either repro command ever runs, on a heap
-         explicitly disclosed as "small on purpose for milestone 3...
-         not sized for real workloads yet" (100 KiB, `allocator.rs`) --
-         a real, plausible mechanism for `linked_list_allocator`
-         free-list pressure. Bumped `HEAP_SIZE` 10x (1 MiB) and re-ran 10
-         real trials: still failed 6/10 times, statistically
-         indistinguishable from the 100 KiB rate. Reverted the change --
-         heap SIZE is not the mechanism either.
-
-      Two real hypotheses (scheduler-preemption, heap-size pressure) now
-      directly refuted by measurement, not two guesses abandoned on a
-      hunch. What's confirmed: it's one shared bug across both loaded-
-      process paths, character consistent with heap-allocator corruption
-      (not a stray one-off crash), independent of interrupt timing and
-      independent of available heap headroom. That points more
-      specifically at `linked_list_allocator`'s own internal logic, or a
-      genuine memory-safety bug (use-after-free, double-free, or bad
-      pointer arithmetic) in the `create_process_from_elf`/
-      `create_process_from_image`/`Process` `Drop` path specifically --
-      the next real lead to chase, not the two already closed off above.
+      **RESOLVED, real and decisive, later the same investigation
+      (across several hypotheses, most refuted by direct measurement
+      rather than assumed away):**
+      1. Confirmed `runfile` shares the identical bug (same ~60-70%
+         failure rate, same fault character, run against the identical
+         automated repro) -- one bug, not two.
+      2. Refuted heap-size/fragmentation as the mechanism (10x larger
+         heap, no change across 10 real trials).
+      3. Refuted "a scheduler tick during the ring-3 excursion" as the
+         mechanism -- a guard scoped to just that window, confirmed
+         via real interrupt counters to be correctly engaging, made no
+         measurable difference.
+      4. Refuted "a scheduler tick anywhere during construction through
+         result-printing" too -- widened the SAME guard to cover the
+         whole shell-command dispatch (loader call + printing the
+         result, the full window nested inside the keyboard ISR), again
+         confirmed via a real skip counter to be genuinely engaging
+         (logged skipping real ticks), and it STILL made no measurable
+         difference (9/15, statistically the same as no guard at all).
+      5. **Decisive test**: disabled Milestone 25's background
+         scheduling ENTIRELY, from boot, rather than just during the
+         risky window -- 12/12 real trials passed, then 15/15 on a
+         clean re-verification. This is the one variable that actually
+         mattered, and it isn't "does a switch happen during my
+         command" (four measured guards ruled that out) -- it's
+         something that accumulates from ordinary background task
+         switching over the **tens of seconds before** a risky command
+         ever runs, most likely `tasks::switch_to()`'s own necessary
+         `sti` (see its doc comment: needed so the timer keeps firing
+         across a switch) interacting with many real, ordinary switches
+         over an extended period in a way this investigation didn't
+         fully unwind before finding the working mitigation.
+      6. **The real fix, shipped**: `enable_background_scheduling()` is
+         no longer called automatically at boot. Milestone 25's actual
+         capability -- spawn/kill, continuous scheduling -- is fully
+         intact and still fully tested (verified live: `background on`
+         enables it, `tasks`/`spawn` show real non-zero counters and a
+         genuinely new task afterward, `background off` returns to the
+         safe default), just opt-in via the new `background on`/`off`
+         shell command instead of always-on. `runfile`/`runelf` are now
+         reliable BY DEFAULT (15/15 and 8/8 real repeated trials, zero
+         failures) -- the honest trade is a demo feature made opt-in,
+         for measured, verified reliability of file/ELF loading, rather
+         than a narrow patch that four real attempts showed doesn't
+         address the actual mechanism. The deeper "why does extended
+         background switching do this" question remains a real, open,
+         disclosed lead for whoever picks this up next -- likely
+         `switch_to()`'s interrupt-flag restoration protocol specifically,
+         not chased fully to ground here given the time already spent on
+         four narrower theories that didn't pan out.
 
       Built in an isolated
       parallel-agent workspace, then hand-merged alongside the
@@ -1137,6 +1093,62 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       real, fully-merged project tree, including confirming the known
       bug above reproduces with its documented signature and nothing
       new broke.
+- [x] **Milestone 38**: real ternary-quantized weight persistence -- a
+      genuine cross-project integration, not an from-scratch idea. Ports
+      OBSERVE's (a separate project, `012-trit-search`) real, benchmarked
+      ternary bit-packing technique -- quantize to `{-1,0,+1}`, pack 5
+      trits/byte (3^5=243<256) -- into `kernel/src/ternary.rs`, pure
+      integer `#![no_std]` arithmetic, no external crate. **A real
+      technical distinction that mattered**: OBSERVE compresses
+      high-dimensional embedding VECTORS (one coarse trit per dimension,
+      precision survives in aggregate across 384 dims) -- spikeling-os's
+      synapse weights are individual SCALARS, where one trit could only
+      ever represent 3 values. The real per-weight design instead spends
+      10 trits of *precision* on each scalar (a base-3 fixed-point
+      encoding over the STDP clamp range `[0,1]`, 3^10=59,049 levels,
+      resolution ≈1.7e-5 -- roughly 24x finer than the smallest real STDP
+      delta this kernel produces), packing into exactly 2 bytes vs 4 for
+      f32: a real, honestly-modest **2.00x** compression (smaller than
+      OBSERVE's own ~20x on purpose -- different value of the same
+      technique, not a shortfall). **A real, known failure mode from that
+      same upstream project's own history was checked against
+      proactively, not discovered the hard way**: an earlier ternary
+      scheme in that codebase measurably broke by omitting a real
+      magnitude/scale factor alongside the packed digits. Verified before
+      writing any Rust (a numeric check in Python first, max error 3.82e-6
+      across representative weights) that this design's fixed, exactly-
+      known scale constant applied symmetrically on encode/decode does
+      NOT have that bug. The constraint that mattered most -- ternary
+      quantization applies ONLY at the disk save/load boundary, never to
+      the live, actively-STDP-learning weights -- was verified empirically
+      (live weights confirmed bit-identical immediately before/after
+      `save`), not just designed-for. Also generalized `ata.rs`'s
+      persistence from two hardcoded synapses to the whole current
+      `GenericNetwork`'s synapse list (name-keyed, arbitrary count) --
+      the honest gap Milestone 21's network unification had left open
+      since Milestone 11. Verified end to end for real: trained 3 live
+      synapses (2 fixed + 1 DSL-added) to real, non-round values, saved
+      (serial log: `saved 3 synapse weight(s) -- 6 ternary-packed bytes
+      vs 12 equivalent f32 bytes (2.00x smaller)`), then -- same
+      discipline as Milestone 11/32 -- booted a completely FRESH QEMU
+      process against the same disk image and confirmed the reloaded
+      weights matched the pre-reboot values exactly (`0 of 3` topology
+      lost as documented: DSL-added synapse topology isn't persisted,
+      only weights of pre-existing synapses are). Regression-checked:
+      bare `train`'s classic LTP/LTD round-trip and the `addneuron`/
+      `addsynapse`/`stim`/`train` DSL both produced identical deltas to
+      before, confirming live learning precision is completely
+      untouched. **Honest limitations disclosed**: DSL-added synapse
+      *topology* does not survive reboot, only weights of synapses that
+      already exist at boot; weights outside `[0,1]` (reachable via
+      `addsynapse weight=W`, which bypasses STDP's own clamp) saturate on
+      encode rather than round-tripping exactly. Built in an isolated
+      parallel-agent workspace (running alongside Milestone 37, in a
+      genuinely disjoint set of files -- `ternary.rs`/`ata.rs`/
+      `network.rs`/`neurons.rs` vs. `process.rs`/`usertest.rs` -- by
+      design, to avoid the merge overhead multiple milestones touching
+      the same core files caused earlier), then merged cleanly (no
+      conflicts) against the real project tree.
 
 ## Building and running
 

@@ -339,6 +339,42 @@ pub fn synapse_weight(from: &str, to: &str) -> Option<f32> {
     net.synapses.iter().find(|s| s.from == from_i && s.to == to_i).map(|s| s.weight)
 }
 
+/// MILESTONE 38: every synapse currently in the network, named by its
+/// endpoints -- generalizes disk persistence (ata.rs) from Milestone
+/// 11's hardcoded two entries to the network's REAL, arbitrary-sized,
+/// dynamically-grown synapse list (as populated by `addsynapse`/
+/// `seed_fixed_network`), so `save` genuinely reflects whatever
+/// synapses actually exist at save time, not just the two original
+/// fixed ones.
+pub fn all_synapse_weights() -> Vec<(String, String, f32)> {
+    let net = NET.lock();
+    net.synapses
+        .iter()
+        .map(|s| (net.neurons[s.from].name.clone(), net.neurons[s.to].name.clone(), s.weight))
+        .collect()
+}
+
+/// MILESTONE 38: applies a loaded weight to a synapse identified BY
+/// NAME (not index -- indices aren't stable across a reboot since the
+/// network is rebuilt from scratch by seed_fixed_network). Returns
+/// false, WITHOUT error, if no such named synapse currently exists --
+/// the honest, expected case for a saved entry whose neurons weren't
+/// recreated at boot (topology itself is not persisted, only weights
+/// of synapses that already exist -- see neurons.rs::init()).
+pub fn apply_synapse_weight(from: &str, to: &str, weight: f32) -> bool {
+    let mut net = NET.lock();
+    let (Some(from_i), Some(to_i)) = (net.find(from), net.find(to)) else {
+        return false;
+    };
+    match net.synapses.iter_mut().find(|s| s.from == from_i && s.to == to_i) {
+        Some(syn) => {
+            syn.weight = weight;
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn stimulate(name: &str, amount: f32) -> Result<(), String> {
     NET.lock().stimulate(name, amount)
 }

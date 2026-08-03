@@ -134,44 +134,30 @@ static TOTAL_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEMO_ACTIVE: AtomicBool = AtomicBool::new(false); // bounded Milestone 5c window only
 static BACKGROUND: AtomicBool = AtomicBool::new(false); // MILESTONE 25: perpetual post-boot scheduling
 
-/// BUGFIX (found while root-causing the Milestone 36 disclosed ELF-loader
-/// page fault): usertest.rs's ring-3 excursions (usertest/runproc/
-/// runfile/runelf, ALL funneled through enter_ring3()/enter_ring3_now())
-/// run with interrupts enabled, deliberately, so the excursion's own
-/// syscalls work -- but that means a background-scheduler timer tick
-/// CAN legitimately fire while nested deep inside one, with CURRENT ==
-/// usize::MAX ("kernel_main/shell is running"). If the scheduler then
-/// picks a different task, timer_tick_switch() below calls switch_to()
-/// on THAT nested, mid-excursion rsp -- which stomps THIS module's own
-/// KERNEL_RSP (a completely different static than usertest.rs's own
-/// same-named KERNEL_RSP, despite sharing a name) with a stack pointer
-/// sitting mid-excursion, and a later scheduler switch back to
-/// "kernel_main" resumes it via switch_to()'s callee-saved-register
-/// convention -- a protocol mismatch with resume_kernel()'s actual
-/// int-0x80-return convention, corrupting execution once it unwinds.
-/// This is the SAME general failure class the earlier, already-fixed
-/// `sti`-in-resume_kernel bug was (a nested timer tick hijacking
-/// execution mid-call-chain) -- just triggered here by the excursion's
-/// OWN interrupts-enabled design (a real, disclosed, documented
-/// limitation in usertest::run()'s own comment) rather than a premature
-/// `sti`. Fixed the same way real kernels handle this class of hazard:
-/// a real, minimal "preemption disabled" guard around exactly the
-/// excursion's duration, checked here and set/cleared by
-/// usertest::run()/enter_ring3_now() around their enter_ring3() calls.
-/// Scoped deliberately narrow -- it only skips SWITCHING a task away
-/// mid-tick, not the timer interrupt itself, so PIT-driven timing
-/// (Milestone 5b) and reap_zombies() below are unaffected.
+/// BUGFIX, re-derived and WIDENED (root-causing the disclosed Milestone
+/// 36 page fault, shared by runfile/runelf, confirmed real via repeated
+/// trials): PROCESS_A/PROCESS_B are built by create_process_from_image()
+/// at BOOT, before enable_background_scheduling() ever runs -- no timer
+/// tick can preempt their construction. runfile/runelf build a process
+/// through the EXACT SAME create_process_from_image()/
+/// create_process_from_elf() call live, from the interactive shell,
+/// AFTER background scheduling is already active -- so a timer tick CAN
+/// legitimately fire mid-construction (during the multi-page mapping
+/// loop, well before any ring-3 excursion even starts) with
+/// CURRENT == usize::MAX ("kernel_main/shell running"). If the scheduler
+/// then picks a different task, timer_tick_switch() calls switch_to() on
+/// THIS nested, mid-construction rsp -- stomping KERNEL_RSP with a stack
+/// pointer that was never a valid task context, corrupting execution once
+/// something later resumes "kernel_main" via that same stale slot.
+///
+/// An earlier, narrower version of this guard covered only the ring-3
+/// excursion itself (enter_ring3_now()) and was directly measured (real
+/// interrupt counters, 10 repeated trials) to have ZERO effect on the
+/// failure rate -- because the actual at-risk window is EARLIER, during
+/// construction, not the excursion. This version is set for the WHOLE
+/// create+run sequence (loader.rs's run_file()/run_elf(), start to
+/// finish) instead of just the narrow ring-3 call.
 pub static RING3_EXCURSION_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// TEMPORARY DIAGNOSTIC (root-causing the Milestone 36 page fault):
-/// counts how many timer/keyboard interrupts landed WHILE
-/// RING3_EXCURSION_ACTIVE was true, to directly correlate interrupt
-/// activity during the excursion window against pass/fail -- same
-/// diagnostic style this project already used elsewhere (instrumenting
-/// Cr3::read() inside the timer handler for an earlier bug). Not meant
-/// to stay long-term.
-pub static TIMER_DURING_EXCURSION: AtomicU64 = AtomicU64::new(0);
-pub static KEYBOARD_DURING_EXCURSION: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn worker_entry_0() -> ! {
     worker_loop(0)
@@ -248,6 +234,19 @@ pub fn run_preemption_demo() {
 /// whichever worker task the scheduler picks over resuming "kernel".
 pub fn enable_background_scheduling() {
     BACKGROUND.store(true, Ordering::SeqCst);
+}
+
+/// The real, working opt-out this session's investigation established
+/// as the honest default (see main.rs's own comment at the boot-time
+/// call site this used to be, and README.md's Milestone 36 entry) --
+/// spawn/kill and continuous scheduling still fully work, just not
+/// automatically from boot anymore.
+pub fn disable_background_scheduling() {
+    BACKGROUND.store(false, Ordering::SeqCst);
+}
+
+pub fn background_scheduling_enabled() -> bool {
+    BACKGROUND.load(Ordering::SeqCst)
 }
 
 /// Locates the raw stack-pointer-storage location for `current`
@@ -392,12 +391,12 @@ pub fn timer_tick_switch() {
     reap_zombies();
 
     // BUGFIX: see RING3_EXCURSION_ACTIVE's own doc comment above -- never
-    // switch a task away while a ring-3 excursion (usertest/runproc/
-    // runfile/runelf) is mid-flight; its own nested rsp is not a valid
-    // task context to save/restore through this mechanism. The timer
-    // interrupt itself still fires and returns normally (PIT timing,
-    // Milestone 5b, is unaffected) -- only the SWITCH decision is
-    // skipped for this one tick.
+    // switch a task away while a loaded-process create+run sequence
+    // (runfile/runelf, start to finish -- construction included, not
+    // just the ring-3 excursion) is mid-flight; its own nested rsp is not
+    // a valid task context. The timer interrupt itself still fires and
+    // returns normally (PIT timing, Milestone 5b, is unaffected) -- only
+    // the SWITCH decision is skipped for this one tick.
     if RING3_EXCURSION_ACTIVE.load(Ordering::SeqCst) {
         return;
     }

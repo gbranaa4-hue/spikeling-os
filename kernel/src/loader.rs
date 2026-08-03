@@ -336,6 +336,14 @@ pub fn run_file(path: &str) -> Result<(), String> {
     // process::run_loaded_process's own doc comment for the full
     // diagnosis), found while verifying Milestone 35's fd syscalls but
     // predating them entirely, fixed here.
+    //
+    // BUGFIX: the real at-risk window turned out to be even wider than
+    // construction+excursion -- see shell.rs's call site (the actual
+    // guard now lives there, wrapping this call AND the result-printing
+    // that follows it, since both run nested in the same keyboard-ISR
+    // call chain). tasks::RING3_EXCURSION_ACTIVE's doc comment has the
+    // full diagnosis, including two narrower guards that were measured
+    // and found insufficient before this one.
     let phys_mem_offset = memory::phys_mem_offset();
     let create_result = memory::with_frame_allocator(|frame_allocator| {
         process::create_loaded_process(frame_allocator, phys_mem_offset, &bytes)
@@ -412,10 +420,7 @@ pub fn seed_test_elf() -> Result<usize, String> {
 /// mapping happens, so a serial log from this call is independent proof
 /// the parser actually read the file's structure -- then hands the
 /// parsed elf::ElfImage (plus the original bytes, needed for the actual
-/// segment-content copy) to process::create_loaded_elf_process()
-/// followed by process::run_loaded_process() (MILESTONE 36 BUGFIX: see
-/// create_loaded_elf_process()'s own doc comment for why this is now
-/// two calls, not one).
+/// segment-content copy) to process::load_and_run_elf().
 pub fn run_elf(path: &str) -> Result<(), String> {
     let bytes = fs::read_file(path).map_err(|e| format!("runelf: could not read '{path}': {e}"))?;
     let _ = writeln!(
@@ -439,18 +444,9 @@ pub fn run_elf(path: &str) -> Result<(), String> {
         );
     }
 
-    // MILESTONE 36 BUGFIX: split into create_loaded_elf_process()
-    // (needs frame_allocator, runs INSIDE with_frame_allocator's
-    // closure -- and only for exactly this call) then the EXISTING
-    // run_loaded_process() (the ring-3 excursion, called AFTER that
-    // closure -- and therefore the global FRAME_ALLOCATOR lock -- has
-    // already returned/dropped). Mirrors run_file()'s own
-    // create_loaded_process()/run_loaded_process() split exactly --
-    // this path used to hold the lock across the whole ring-3
-    // excursion, reproducing the same real hazard Milestone 35 already
-    // found and fixed for the flat-binary path (see
-    // process::create_loaded_elf_process()'s own doc comment for the
-    // full diagnosis).
+    // BUGFIX: see run_file()'s own comment above -- the real guard now
+    // lives at shell.rs's call site, covering this call plus the
+    // result-printing that follows it.
     let phys_mem_offset = memory::phys_mem_offset();
     let create_result = memory::with_frame_allocator(|frame_allocator| {
         process::create_loaded_elf_process(frame_allocator, phys_mem_offset, &bytes, &elf_image)

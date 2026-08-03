@@ -121,3 +121,79 @@ pub fn user_code_selector() -> SegmentSelector {
 pub fn user_data_selector() -> SegmentSelector {
     GDT.1.user_data_selector
 }
+
+/// MILESTONE 37: a SECOND, dedicated ring-0 stack, structurally
+/// identical to TSS's own privilege_stack_table[0] stack above but used
+/// ONLY while process::run_forked_child() is driving a forked child's
+/// nested ring-3 excursion (from inside the PARENT's own already-
+/// in-flight `wait()` syscall) -- see set_syscall_stack_top()'s own doc
+/// comment for the real bug this exists to fix, found and diagnosed via
+/// an ACTUAL page fault (instruction fetch at VirtAddr(0x200)) during
+/// real QEMU testing, not guessed at.
+const CHILD_EXCURSION_STACK_SIZE: usize = 4096 * 5;
+static mut CHILD_EXCURSION_STACK: [u8; CHILD_EXCURSION_STACK_SIZE] = [0; CHILD_EXCURSION_STACK_SIZE];
+
+/// The top-of-stack address for CHILD_EXCURSION_STACK above -- same
+/// `&raw const` + VirtAddr::from_ptr() pattern TSS's own two stacks use
+/// in the lazy_static! block up top.
+pub fn child_excursion_stack_top() -> VirtAddr {
+    let stack_start = VirtAddr::from_ptr(&raw const CHILD_EXCURSION_STACK);
+    stack_start + CHILD_EXCURSION_STACK_SIZE as u64
+}
+
+/// MILESTONE 37: temporarily repoints `privilege_stack_table[0]` --
+/// the ONE stack the CPU loads RSP from on EVERY ring3->ring0
+/// transition, `int 0x80` included, ALWAYS reset to the exact same
+/// fixed top address regardless of what was on it before -- at a
+/// caller-supplied stack top, returning the PREVIOUS value so the
+/// caller can restore it once done.
+///
+/// **The real, diagnosed bug this fixes**: process::wait_for_child()
+/// drives a forked child to completion by entering ring 3 for it FROM
+/// INSIDE the PARENT's own already-in-flight `wait()` syscall dispatch
+/// (itself reached via the PARENT's own `int 0x80`, whose CPU-pushed
+/// InterruptStackFrame -- the parent's saved rip/cs/rflags/rsp/ss,
+/// required to correctly resume the PARENT once wait() returns -- sits
+/// at the TOP of the shared privilege_stack_table[0] stack). Without
+/// this fix, the FIRST syscall the child itself makes (this
+/// milestone's own test child calls `exec()` immediately) triggers
+/// ANOTHER `int 0x80`, which -- because privilege_stack_table[0] always
+/// resets to the SAME fixed top -- pushes the CHILD's own
+/// InterruptStackFrame at the EXACT SAME address as the PARENT's,
+/// silently destroying it. Confirmed the hard way in a real QEMU boot:
+/// fork()/wait()/exec() all ran and logged correctly (child created,
+/// parent's message printed, child resumed at its exact fork()-time
+/// rip, exec() replaced its code, the exec()'d program's write()
+/// printed correctly) right up until the child's own exit() -- which
+/// resumed into a stack frame already overwritten by the exec/write
+/// syscalls that ran in between, producing a real page fault
+/// (instruction fetch at VirtAddr(0x200), a bogus address popped off a
+/// corrupted stack) instead of correctly returning to the parent.
+///
+/// process::run_forked_child() calls this with
+/// `child_excursion_stack_top()` immediately before entering the
+/// child, and again with the returned OLD value immediately after --
+/// so every syscall the CHILD makes during that window lands on its
+/// own separate CHILD_EXCURSION_STACK, leaving the PARENT's own
+/// in-flight wait() syscall's saved frame (on the original, shared
+/// stack) completely untouched.
+///
+/// Mutates the lazy_static TSS's live memory directly through an
+/// unsafe cast from the shared `&'static` reference lazy_static
+/// normally hands out -- safe here specifically because this kernel is
+/// single-core and every call to this function brackets one
+/// synchronous, non-reentrant excursion (this milestone's own design
+/// enforces at most one nested child excursion at a time -- see
+/// usertest::is_in_child_resume()). The CPU re-reads this field fresh
+/// from the TSS's own memory on every ring3->ring0 transition (it is
+/// not cached anywhere else, e.g. in a register), so the new value
+/// takes effect immediately, with no need to reload TR / call
+/// load_tss() again.
+pub fn set_syscall_stack_top(new_top: VirtAddr) -> VirtAddr {
+    let tss_ptr: *mut TaskStateSegment = (&*TSS as *const TaskStateSegment).cast_mut();
+    unsafe {
+        let old = (*tss_ptr).privilege_stack_table[0];
+        (*tss_ptr).privilege_stack_table[0] = new_top;
+        old
+    }
+}
