@@ -148,6 +148,28 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+    // MILESTONE 41: SIGSEGV -- a page fault with a hardware-recorded
+    // CPL=3 code segment (the CPU's OWN record of the privilege level
+    // that was executing when the fault occurred, not anything
+    // process-supplied code could fake) means real userspace code
+    // faulted, not a kernel bug. Every prior milestone treated ANY page
+    // fault as fatal (hlt_loop() below, unconditionally) -- meaning a
+    // single buggy ring-3 program could take down the entire kernel.
+    // This is real process isolation for faults, not just for memory:
+    // terminate the offending process, keep the kernel running.
+    // ACTIVE_PROCESS != 0 is the same "a process.rs-owned process is
+    // really the one in ring 3 right now" check syscall_dispatch's own
+    // `active` variable already uses.
+    let active = crate::process::ACTIVE_PROCESS.load(Ordering::Relaxed);
+    if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3 && active != 0 {
+        let _ = writeln!(
+            serial(),
+            "milestone 41: SIGSEGV -- process {active} page-faulted at {:?} (real hardware CPL=3, error code {:?}) -- terminating this process, kernel continues",
+            Cr2::read(),
+            error_code
+        );
+        crate::usertest::terminate_faulted_process_and_resume_kernel();
+    }
     let mut port = serial();
     let _ = writeln!(port, "EXCEPTION: PAGE FAULT");
     let _ = writeln!(port, "Accessed Address: {:?}", Cr2::read());

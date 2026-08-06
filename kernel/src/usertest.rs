@@ -883,6 +883,137 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 }
             }
         }
+        10 => {
+            // MILESTONE 40: pipe(pipefd_ptr) -> 0 on success, u64::MAX
+            // on failure. rdi = pointer to TWO consecutive u64 slots in
+            // the caller's own memory -- offset 0 gets the new read fd,
+            // offset 8 gets the new write fd (POSIX's own
+            // `pipe(int pipefd[2])` out-param shape, just u64-per-slot
+            // instead of int-per-slot to match this ABI's existing
+            // convention of passing/returning whole registers). Reads
+            // 3/4/5/6 (open/read/fdwrite/close) already transparently
+            // work on the fds this hands back -- process::read_fd()/
+            // write_fd()/close_fd() dispatch on the fd table entry's
+            // real kind (file vs. pipe end) internally, no separate
+            // pipe-specific syscall needed for the actual I/O.
+            let pipefd_ptr = regs.rdi;
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 40: syscall PIPE called with no active process (plain usertest excursion has no fd table) -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::pipe_create(active) {
+                    Some((read_fd, write_fd)) => {
+                        unsafe {
+                            core::ptr::write(pipefd_ptr as *mut u64, read_fd);
+                            core::ptr::write((pipefd_ptr as *mut u64).wrapping_add(1), write_fd);
+                        }
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 40: syscall PIPE (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- created pipe, read_fd={read_fd} write_fd={write_fd}",
+                            regs.cs
+                        );
+                        regs.rax = 0;
+                    }
+                    None => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 40: syscall PIPE (process {active}) -- FAILED (fd table full, or all MAX_PIPES global pipe slots already in use) -- returning u64::MAX"
+                        );
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        11 => {
+            // MILESTONE 40: dup(oldfd) -> new fd (u64::MAX on failure).
+            // rdi = oldfd. See process::dup_fd()'s own doc comment for
+            // the real-vs-honest-simplified sharing semantics (pipes:
+            // real shared reference; files: disclosed deep copy, same
+            // limitation fork() already has for files).
+            let oldfd = regs.rdi;
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 40: syscall DUP called with no active process -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::dup_fd(active, oldfd) {
+                    Some(newfd) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 40: syscall DUP (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- fd {oldfd} duplicated to new fd {newfd}",
+                            regs.cs
+                        );
+                        regs.rax = newfd;
+                    }
+                    None => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 40: syscall DUP (process {active}) -- FAILED, fd {oldfd} not open or fd table full -- returning u64::MAX"
+                        );
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        12 => {
+            // MILESTONE 40: dup2(oldfd, newfd) -> newfd on success
+            // (u64::MAX on failure). rdi = oldfd, rsi = newfd. See
+            // process::dup2_fd()'s own doc comment -- closes whatever
+            // was already at `newfd` first (via the real close_fd()
+            // path, not a silent overwrite), and fd==newfd is a real,
+            // explicitly-checked no-op rather than accidentally closing
+            // the fd it's supposed to preserve.
+            let oldfd = regs.rdi;
+            let newfd = regs.rsi;
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 40: syscall DUP2 called with no active process -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::dup2_fd(active, oldfd, newfd) {
+                    Some(true) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 40: syscall DUP2 (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- fd {oldfd} duplicated onto fd {newfd}",
+                            regs.cs
+                        );
+                        regs.rax = newfd;
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 40: syscall DUP2 (process {active}) -- FAILED, fd {oldfd} not open or newfd {newfd} out of range -- returning u64::MAX"
+                        );
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        13 => {
+            // MILESTONE 41: kill(pid) -- SIGKILL-equivalent, rdi=target
+            // pid. Returns 1 on success, 0 on failure (no process this
+            // kernel has ever needed a "returns u64::MAX on failure"
+            // convention couldn't just as honestly express as 0/1 here,
+            // since a valid pid is never 0). See process::kill()'s own
+            // doc comment for exactly what this does and its one real,
+            // disclosed limitation.
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 41: syscall KILL called with no active process -- ignoring, returning 0");
+                regs.rax = 0;
+            } else {
+                let target_pid_arg = regs.rdi;
+                if target_pid_arg > u8::MAX as u64 {
+                    let _ = writeln!(serial(), "milestone 41: syscall KILL (process {active}) -- pid argument {target_pid_arg} out of range -- returning 0");
+                    regs.rax = 0;
+                } else {
+                    let ok = crate::process::kill(active, target_pid_arg as u8);
+                    let _ = writeln!(
+                        serial(),
+                        "milestone 41: syscall KILL (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- target pid {target_pid_arg}, result={ok}",
+                        regs.cs
+                    );
+                    regs.rax = if ok { 1 } else { 0 };
+                }
+            }
+        }
         other => {
             let _ = writeln!(
                 serial(),
@@ -974,6 +1105,30 @@ unsafe extern "C" fn resume_kernel(_saved_rsp: u64) -> ! {
         "pop rbx",
         "ret",
     );
+}
+
+/// MILESTONE 41: SIGSEGV-equivalent -- called from interrupts.rs's
+/// page_fault_handler when a real page fault occurs with a
+/// hardware-recorded CPL=3 (genuinely inside a process.rs-owned ring-3
+/// excursion, not a kernel bug). Does EXACTLY what the exit syscall
+/// (rax=1) arm above does when `active != 0` -- restores the kernel's
+/// own CR3, clears ACTIVE_PROCESS, and unwinds back to whichever kernel
+/// resume point (KERNEL_RSP, or CHILD_KERNEL_RSP if nested inside a
+/// forked-child excursion) is currently correct. The ONLY difference
+/// from the exit syscall's own path is what triggers it: a hardware
+/// fault instead of the process's own voluntary `int 0x80`.
+/// resume_kernel() itself doesn't care which one drove it here -- the
+/// CPU-pushed page-fault interrupt frame is simply discarded, never
+/// `iretq`'d back into.
+pub(crate) fn terminate_faulted_process_and_resume_kernel() -> ! {
+    crate::process::restore_kernel_cr3();
+    crate::process::ACTIVE_PROCESS.store(0, Ordering::SeqCst);
+    let saved = if IN_CHILD_RESUME.load(Ordering::SeqCst) {
+        CHILD_KERNEL_RSP.load(Ordering::SeqCst)
+    } else {
+        KERNEL_RSP.load(Ordering::SeqCst)
+    };
+    unsafe { resume_kernel(saved) };
 }
 
 /// MILESTONE 27: the `usertest` shell command's entry point -- enters

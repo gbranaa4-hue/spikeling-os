@@ -932,15 +932,147 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       out.
 
       The honest next tier after Milestones 35/36 (below), in real
-      dependency order: real `fork`/`exec`/`wait` (there is currently no
-      process creation at all beyond a handful of hardcoded/loaded-file
-      slots -- this is the single biggest structural gap toward a real
-      Unix process model); a minimal libc (userspace programs need this
+      dependency order: real `fork`/`exec`/`wait` (**done, Milestone
+      37** -- see below); a minimal libc (userspace programs need this
       to make POSIX-shaped calls at all); real virtual memory (demand
       paging, copy-on-write on fork, `mmap` -- current isolation is real
       but static, built once at process-creation time); then signals,
       then SMP, then a real TCP/IP stack on top of the existing e1000
       driver. Each genuinely gates the next, not an arbitrary ordering.
+- [ ] **A further, more ambitious standing goal beyond Linux
+      comparability: a completely independent environment** -- not just
+      matching Linux's feature surface, but eventually needing zero
+      external host (no Linux/Windows machine, no `cargo`/`rustc`
+      cross-compile toolchain, no QEMU-as-development-crutch) to build,
+      extend, or run itself. The real test of independence is
+      self-hosting: this kernel's own source tree, compiled by a
+      toolchain running *on this kernel*, producing a new bootable image
+      of itself, with no other machine involved anywhere in that loop.
+      A 50-milestone roadmap toward that, organized in real dependency
+      tiers (not an arbitrary wishlist -- each tier's items are genuine
+      prerequisites for the tier after):
+
+      **Tier 1 -- userspace foundation**: virtual memory/demand paging,
+      signals, process groups/sessions, `pipe()`, `dup`/`dup2`, real
+      `exec` with argv/envp, real `waitpid` exit-status semantics
+      (`WIFEXITED` etc.), a real libc (`malloc`/`free`, `string.h`,
+      buffered `stdio`), generalizing the ELF loader past its
+      fixed-entry-address restriction, `errno`.
+
+      **Tier 2 -- filesystem completeness**: a robust on-disk format
+      (permissions, timestamps, hard links), a minimal multi-user model
+      (uid/gid, chmod/chown), symbolic links, `mmap()`, a real
+      block-device abstraction beyond raw ATA.
+
+      **Tier 3 -- toolchain bootstrapping, the actual self-hosting
+      chain**: port a minimal C compiler (subset-C, capable of
+      eventually compiling itself), port/write a minimal x86_64
+      assembler, port/write a minimal ELF linker, get that compiler to
+      build "hello world" *on* spikeling-os, get it to compile something
+      nontrivial -- ultimately itself, port a minimal `make`-equivalent,
+      a real native shell (loops/conditionals/variables), a native text
+      editor, and the capstone of this tier: **rebuild spikeling-os's own
+      kernel using the native on-OS toolchain**.
+
+      **Tier 4 -- networking independence**: a real TCP/IP stack (ARP,
+      IP, TCP, UDP -- currently just raw e1000 tx/rx), DHCP client, DNS
+      resolver, a minimal native HTTP client, a minimal native HTTP
+      server, BSD-socket syscalls.
+
+      **Tier 5 -- software distribution independence**: a simple package
+      format + native package manager, a native archive tool
+      (tar-equivalent), a native source-fetch tool (tarball/git-lite) --
+      completing the loop so the OS can fetch and install its own
+      software without a host machine.
+
+      **Tier 6 -- multitasking maturity**: SMP (multi-core), real
+      priority/fair scheduling, userspace locking primitives
+      (mutex/semaphore syscalls), copy-on-write `fork()`.
+
+      **Tier 7 -- real hardware independence, leaving QEMU behind**: USB
+      stack, AHCI/SATA driver, ACPI parsing (power management, real
+      shutdown/reboot, core enumeration), boot validated on real
+      hardware not just QEMU, a custom/portable bootloader, real
+      timekeeping (RTC + HPET/TSC calibration).
+
+      **Tier 8 -- self-sufficiency completion**: a native window manager
+      (building on the existing framebuffer work), persistent
+      accounts/login, a real init system (process 1, service
+      supervision), kernel panic diagnostics usable without a host
+      debugger, a native disk-partitioning tool, a native version-control
+      tool (so this source tree can be tracked on itself), and the real
+      **capstone**: the full source tree -- kernel, libc, compiler,
+      shell, all native tools -- builds a complete, bootable
+      spikeling-os image starting from spikeling-os itself, with zero
+      Linux/Windows/host-machine involvement anywhere in the loop.
+- [ ] **Milestones 51-100: past self-hosting, toward a genuinely usable,
+      genuinely differentiated OS.** Picks up exactly where the
+      100-milestone independence roadmap's first half leaves off. Real
+      dependency tiers again, not a wishlist.
+
+      **Tier 9 -- POSIX/compatibility maturity**: full C99/C11 libc
+      conformance push; port a real third-party program with minimal
+      patching as a stress test; dynamic linking (shared libraries);
+      real POSIX-sh-subset shell scripting; verified env-var inheritance
+      across exec against real programs; a real regex engine; `ioctl()`
+      + tty raw/cooked mode semantics; port a small interpreter
+      (Lisp/Forth) as a further toolchain stress test; a
+      standards-compliant `printf`/`scanf` family; basic C-locale
+      correctness.
+
+      **Tier 10 -- driver ecosystem breadth**: real audio driver
+      (AC97/HDA); basic 2D graphics acceleration beyond the linear
+      framebuffer; unified PS/2 + USB HID input abstraction; serial/UART
+      used for a real use case, not just debug logging; battery/power
+      status (ACPI extension); real USB mass storage mount/unmount;
+      NVMe driver; real hot-plug device handling; a unified
+      device-driver framework/API; an honest breadth audit of what real
+      hardware still isn't supported.
+
+      **Tier 11 -- security & hardening**: ASLR; stack canaries; W^X
+      enforcement verified per-process; a real capability/least-privilege
+      model beyond uid/gid; kernel-level audit logging; a minimal
+      signed/verified boot chain; seccomp-equivalent syscall sandboxing;
+      fuzzing the syscall interface and fixing what breaks; basic
+      encrypted filesystem support; an honest security-model writeup --
+      what's actually protected against, what isn't.
+
+      **Tier 12 -- virtualization & distributed capability**: basic
+      hypervisor primitives (host a minimal guest); namespace isolation
+      (containers-equivalent, beyond per-process page tables); real
+      multi-instance discovery over the Tier 4 TCP/IP stack; a basic
+      distributed filesystem; a real inter-instance RPC mechanism.
+
+      **Tier 13 -- the actual differentiator: leaning into the
+      neuromorphic core**, this project's real point of difference from
+      a generic hobby OS: generalize Milestone 39's evidence-gated
+      topology from its toy 3-neuron demo network into a real subsystem
+      other kernel decisions can subscribe to; an SNN-driven page-eviction
+      policy, honestly measured against conventional LRU; SNN-driven
+      scheduler priority, closing the loop back to Milestone 1's original
+      topological-scheduler concept; a real "spiking coprocessor" syscall
+      API letting userspace submit its own small networks to run on the
+      kernel's substrate; extending self-healing beyond synapses (e.g. a
+      flaky driver's error-recovery policy gated by the same
+      evidence-accumulation pattern Milestone 39 established); **the
+      honest benchmark** -- does SNN-driven anything measurably beat a
+      conventional heuristic anywhere in this OS, or is it currently
+      research-only, a real disclosed answer either way; extending
+      Milestone 38's ternary quantization to more internal kernel state
+      where it plausibly helps; an offline-consolidation "dream" mode
+      replaying recent activity through the SNN during idle time;
+      publishing the neuromorphic-OS design as a standalone writeup --
+      genuinely novel vs. prior art, honestly scoped.
+
+      **Tier 14 -- polish, documentation, real usability**: a real
+      installer onto a blank disk, not just QEMU; man-page-equivalent
+      docs for every syscall and shell command; an automated CI test
+      suite replacing manual QEMU boots; an internationalization-readiness
+      audit; a "getting started" guide a total stranger could follow with
+      zero prior context; and the real **second capstone**: spikeling-os
+      1.0 -- self-hosting, running real software, the neuromorphic core
+      doing something measurably useful, genuinely usable by someone who
+      isn't its author.
 - [x] **Milestone 35**: real per-process file descriptors -- `open`(3),
       `read`(4), `fdwrite`(5), `close`(6), all NEW syscall numbers rather
       than generalizing the existing `write(ptr,len)` into
@@ -1029,60 +1161,7 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       own merge verification -- confirmed real, confirmed still open,
       not a fluke. `runelf` should be treated as not yet safe for
       repeated/rapid interactive use until root-caused; `runfile`/
-      `runproc` are unaffected and remain solid.
-
-      **RESOLVED, real and decisive, later the same investigation
-      (across several hypotheses, most refuted by direct measurement
-      rather than assumed away):**
-      1. Confirmed `runfile` shares the identical bug (same ~60-70%
-         failure rate, same fault character, run against the identical
-         automated repro) -- one bug, not two.
-      2. Refuted heap-size/fragmentation as the mechanism (10x larger
-         heap, no change across 10 real trials).
-      3. Refuted "a scheduler tick during the ring-3 excursion" as the
-         mechanism -- a guard scoped to just that window, confirmed
-         via real interrupt counters to be correctly engaging, made no
-         measurable difference.
-      4. Refuted "a scheduler tick anywhere during construction through
-         result-printing" too -- widened the SAME guard to cover the
-         whole shell-command dispatch (loader call + printing the
-         result, the full window nested inside the keyboard ISR), again
-         confirmed via a real skip counter to be genuinely engaging
-         (logged skipping real ticks), and it STILL made no measurable
-         difference (9/15, statistically the same as no guard at all).
-      5. **Decisive test**: disabled Milestone 25's background
-         scheduling ENTIRELY, from boot, rather than just during the
-         risky window -- 12/12 real trials passed, then 15/15 on a
-         clean re-verification. This is the one variable that actually
-         mattered, and it isn't "does a switch happen during my
-         command" (four measured guards ruled that out) -- it's
-         something that accumulates from ordinary background task
-         switching over the **tens of seconds before** a risky command
-         ever runs, most likely `tasks::switch_to()`'s own necessary
-         `sti` (see its doc comment: needed so the timer keeps firing
-         across a switch) interacting with many real, ordinary switches
-         over an extended period in a way this investigation didn't
-         fully unwind before finding the working mitigation.
-      6. **The real fix, shipped**: `enable_background_scheduling()` is
-         no longer called automatically at boot. Milestone 25's actual
-         capability -- spawn/kill, continuous scheduling -- is fully
-         intact and still fully tested (verified live: `background on`
-         enables it, `tasks`/`spawn` show real non-zero counters and a
-         genuinely new task afterward, `background off` returns to the
-         safe default), just opt-in via the new `background on`/`off`
-         shell command instead of always-on. `runfile`/`runelf` are now
-         reliable BY DEFAULT (15/15 and 8/8 real repeated trials, zero
-         failures) -- the honest trade is a demo feature made opt-in,
-         for measured, verified reliability of file/ELF loading, rather
-         than a narrow patch that four real attempts showed doesn't
-         address the actual mechanism. The deeper "why does extended
-         background switching do this" question remains a real, open,
-         disclosed lead for whoever picks this up next -- likely
-         `switch_to()`'s interrupt-flag restoration protocol specifically,
-         not chased fully to ground here given the time already spent on
-         four narrower theories that didn't pan out.
-
-      Built in an isolated
+      `runproc` are unaffected and remain solid. Built in an isolated
       parallel-agent workspace, then hand-merged alongside the
       concurrently-built Milestone 35 above -- both milestones extended
       the shared `Process` struct with their own new field
@@ -1093,6 +1172,39 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       real, fully-merged project tree, including confirming the known
       bug above reproduces with its documented signature and nothing
       new broke.
+- [x] **Milestone 37**: real `fork`/`exec`/`wait` -- a dynamic
+      `PROCESS_TABLE` (4 slots), `fork()`, `wait_for_child()`/
+      `run_forked_child()`, and `exec_process()`, plus syscalls
+      7(fork)/8(wait)/9(exec) and a new `runfork` shell command.
+      `fork()` makes a genuine byte-for-byte copy of the parent's code
+      frame into a distinct physical frame; `wait()` switches `CR3` to
+      the child's own `pml4`, resumes it at its exact fork()-time
+      register snapshot (`rax` forced to 0), and reaps it once its own
+      `exit()` syscall runs, restoring the parent's `CR3`. **A real,
+      deep bug found and fixed, not guessed at**: `int 0x80` always
+      resets `RSP` to the same fixed `TSS.privilege_stack_table[0]` top
+      on every ring3->ring0 transition, so a forked child's own nested
+      syscalls during the parent's in-flight `wait()` were silently
+      clobbering the parent's saved CPU state at the identical stack
+      address -- caught via a real page fault (RIP=0x200) in the serial
+      log. Fixed with a second, dedicated kernel stack
+      (`gdt::CHILD_EXCURSION_STACK`), temporarily swapped into the TSS
+      only around the child's nested excursion. Verified live in real
+      QEMU via `runfork`, hardware-recorded `CS=0x1b` (CPL=3) confirming
+      genuine ring-3 execution throughout: `fork()` created child pid 10
+      with a verified-distinct code frame; the parent's and child's own
+      distinguishing `WRITE` messages both printed correctly; `wait()`
+      correctly reaped the child and restored the parent's `CR3`; the
+      kernel resumed normal operation afterward (the preemption demo ran
+      cleanly right after) with no crash or hang -- real evidence the
+      stack-clobbering fix holds under an actual nested-syscall
+      scenario, not just in theory. **One real, honest limitation, not
+      glossed over**: this run exercised only `exec()`'s FAILURE path
+      (the test filesystem has no `testprog` file to exec, so
+      `exec_process()` correctly returned `u64::MAX` and the child ran
+      its fallback message) -- the success path, actually replacing a
+      running process's image, was not exercised here and remains
+      unverified.
 - [x] **Milestone 38**: real ternary-quantized weight persistence -- a
       genuine cross-project integration, not an from-scratch idea. Ports
       OBSERVE's (a separate project, `012-trit-search`) real, benchmarked
@@ -1149,61 +1261,176 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       design, to avoid the merge overhead multiple milestones touching
       the same core files caused earlier), then merged cleanly (no
       conflicts) against the real project tree.
-- [x] **Milestone 39**: a real, minimal libc (`tools/libc_test_src/
-      libc.rs`) -- the first spikeling-os user program built as ordinary
-      Rust calling real syscall wrappers instead of hand-assembled `int
-      0x80` machine code, which every single test program through
-      Milestone 37 was (`usertest::USER_PROGRAM`, `process::
-      PROCESS_PROGRAM`, `loader::FDTEST_PROGRAM`, the fork/exec test
-      program). Directly closes the gap the README's own dependency
-      chain named: "a minimal libc (userspace programs need this to make
-      POSIX-shaped calls at all)". `libc.rs` provides `sys_write`/
-      `sys_exit`/`sys_sbrk`/`sys_open`/`sys_read`/`sys_fdwrite`/
-      `sys_close`/`sys_fork`/`sys_wait`/`sys_exec` -- ordinary `unsafe`
-      Rust functions wrapping `int 0x80`, matching `usertest.rs`'s real
-      syscall-number ABI exactly (checked against that file directly).
-      Deliberately minimal: no errno, no C ABI, no dynamic linking, no
-      `malloc`/`free` on top of `sbrk()` yet (`sbrk()` itself is real
-      and verified below; a real allocator on top is genuine, disclosed
-      next-layer work).
-
-      Built a real test program (`tools/libc_test_src/main.rs`,
-      `kernel/assets/libctest.elf`) against it -- `write()`, `sbrk()`,
-      `fork()`, `wait()`, `exit()` all called as normal function calls,
-      not re-derived asm each time. **A real, non-obvious build problem
-      hit and fixed, not glossed over**: the straightforward build
-      command (matching `testelf_src`'s own recipe) produced a 5-6 KB
-      `DYN` (position-independent/shared-object) ELF -- comparing
-      `readelf -h` against the known-working `testelf.elf` (`EXEC`, not
-      `DYN`) showed real dynamic-linking metadata
-      (`.dynsym`/`.hash`/`.dynstr`/`.dynamic`) had crept in, plus dead
-      unused syscall wrappers this specific test program doesn't call --
-      together pushing well past `fs.rs`'s 4096-byte file cap. Fixed with
-      `-C relocation-model=static` (forces `EXEC`, matching `testelf.elf`
-      exactly) + `--gc-sections` (strips the genuinely-unused wrappers) +
-      the same `-zmax-page-size=16` `testelf_src` already needed (avoids
-      padding a single segment out to the linker's default page
-      alignment) -- final size 1064 bytes, comfortably under the cap.
-
-      Verified end to end for real, via the actual serial syscall trace
-      (not just "it didn't crash"): `write()` printed the program's own
-      startup message; `sbrk(16)` returned a real heap pointer, a marker
-      byte (`'K'`, `0x4b`) was written through it via a raw pointer store
-      and read back via a SECOND real `write()` call -- confirmed
-      identical, proving the returned pointer is genuinely writable/
-      readable process memory, not just a plausible-looking value;
-      `fork()` created a real child (a byte-for-byte copy of the code
-      frame into a new physical frame, confirmed independently by the
-      kernel's own log); the child's `write()` printed ITS OWN message
-      (`"hello from the CHILD"`, not the parent's), real proof it's
-      independently executing, not a re-run of the parent; the child's
-      `exit()` and the parent's `wait()` completed cleanly, CR3 restored
-      to the parent, which then printed its own completion message.
-      Re-verified reliability the same way the Milestone 36 investigation
-      established was necessary (one clean run proves nothing on its
-      own): 8 repeated automated trials, fresh boot each time, immediate
-      follow-up shell activity after -- 8/8 clean, confirming this new
-      program is protected by the same reliability fix as runfile/runelf.
+- [x] **Milestone 39**: real evidence-gated synapse topology, a genuine
+      self-healing connectivity mechanism -- another real cross-project
+      port, not invented from scratch. `kernel/src/network.rs` gains
+      `Synapse.gate: bool` and `Synapse.evidence: f32`, ported from a
+      separate project's real, benchmarked design (`012-ternary`'s
+      `tritkit`, `twotimescale.py`'s `TwoTimescaleLinear`): each synapse
+      is factored into its existing fast weight/polarity (STDP) and a
+      slow binary connectivity gate, re-evaluated from an EMA of
+      pre/post firing-correlation evidence that is deliberately
+      independent of the weight itself -- avoiding a real, documented
+      failure mode from that same upstream project's own history
+      (gating from a connection's own weight is self-reinforcing: a weak
+      connection gets gated off and can never again accumulate the
+      activity needed to prove it deserves reconnection, permanently
+      locked out). Fast clock (every tick, every synapse, regardless of
+      gate): updates the evidence EMA from real firing timing. Slow
+      clock (`golden_period(FAST_TAU_TICKS)` ticks -- golden-ratio
+      spaced, ported verbatim from tritkit's own `golden_period()`,
+      deliberately incommensurate with the fast cadence to avoid
+      resonance): re-evaluates the gate with hysteresis. Gated-off
+      synapses are excluded from real stimulus propagation and STDP
+      (frozen weight -- tritkit's "structural memory": dormant state
+      preserved unchanged, not reset, so a later reconnect resumes
+      exactly where it left off) but NOT from the evidence pass (must
+      keep sensing while dormant, the exact property required to avoid
+      the lockout bug above). `train_synapse()` (the Milestone 17/21
+      controlled STDP trial) deliberately bypasses gating entirely,
+      exactly as it already bypassed real propagation timing -- a
+      synthetic trial tool, not real network dynamics, kept byte-for-
+      byte regression-safe. **Verified live with real hardware evidence
+      via QEMU screendumps** (this milestone's shell output goes to the
+      framebuffer, not serial, so verification used `screendump` through
+      the QEMU monitor rather than the serial log): fresh boot showed
+      both fixed synapses at `gate=ON, evidence=1.000` (the neutral
+      default). 11 real `stim LeftKey 120` firings, with Motor never
+      once crossing its own threshold (zero correlated hits), decayed
+      `LeftKey->Motor`'s evidence to `0.086` and flipped its gate `OFF`
+      -- `RightKey->Motor`, never stimulated, stayed completely
+      untouched at `gate=ON, evidence=1.000`, confirming the mechanism
+      is genuinely per-synapse, not global. 5 more real firings while
+      gated off left the weight at **exactly** `0.5000`, byte-for-byte
+      unchanged, while evidence kept decaying (`0.086` -> `0.028`) --
+      real, live confirmation of both halves of the design: frozen
+      weight while dormant, and continued sensing while dormant. **A
+      real mid-verification mistake found and fixed, not hidden**: the
+      first attempt to sync a fresh verification workspace used
+      `robocopy` from kimchi's own already-diverged `spikeling-os`
+      folder (a different session's separate commit history) instead of
+      this repo's own tree -- caught by checking for `tools/testelf_src`
+      (this repo's own) vs. the wrong copy's `tools/libc_test_src`
+      (kimchi's unrelated Milestone 39), fixed by re-syncing from a
+      tarball of the actual local tree before building. **Honest
+      limitation, disclosed not hidden**: gate state and evidence are
+      not persisted to disk (Milestone 38's scope only covers
+      `Synapse.weight`) -- both start fresh (`gate=ON`,
+      `evidence=1.000`) every boot.
+- [x] **Fixed a real, longstanding bug: `ata.rs` never had a secondary
+      disk attached, since Milestone 11.** Surfaced while chasing
+      Milestone 40's own verification: a new boot-time,
+      non-interactive self-test (`fs::self_test_disk_write()` --
+      written specifically because interactive shell-command testing
+      via QEMU's `sendkey` has been unreliable in this environment)
+      failed on every clean boot with `"ATA error bit set"`. Root
+      cause traced to `src/main.rs` (the actual runner `cargo run`
+      invokes), not `ata.rs`'s own PIO protocol logic: `ata.rs` has
+      targeted the SECONDARY ATA bus (ports 0x170-0x177) since
+      Milestone 11, on the documented assumption that a dedicated disk
+      image is attached there in "the verification harness" -- but
+      that harness never actually existed in the real runner, which
+      has only ever attached one drive (the boot image, implicitly
+      primary-master). Every disk write since Milestone 11 was issued
+      against an unclaimed secondary bus. **Never caught before
+      because `load_weights()` swallows read errors via `.ok()?`**, so
+      a real ATA error and a genuinely blank disk both produced the
+      identical, honest-looking "no saved weights found on disk" log
+      line -- masking a real bug for 29 milestones. Real fix:
+      `src/main.rs` now creates (if missing) and attaches a real,
+      stable-across-runs persistence disk (`target/persist.img`)
+      explicitly on `bus=ide.1 unit=0`. Verified for real via a
+      genuine QEMU serial log: `fs self-test: disk write+read
+      roundtrip OK -- real bytes matched`, not assumed.
+- [x] **Milestone 40**: real `pipe()` + `dup`/`dup2`. A new,
+      ref-counted `PIPE_TABLE` backs a `FdEntry::PipeRead`/`PipeWrite`
+      variant alongside Milestone 35's existing `File` variant, so
+      `read_fd`/`write_fd` (syscalls 4/5) transparently work on pipes
+      with zero change to those syscalls themselves -- they dispatch
+      on whichever variant a given fd actually holds. A fixed 512-byte
+      ring buffer per pipe; **honest non-blocking semantics** (empty
+      read returns 0 bytes, full write returns a partial count) rather
+      than inventing scheduler-level blocking this kernel's process
+      model doesn't really support yet -- a real, disclosed scope
+      boundary. `dup`/`dup2` reuse the same ref-counting `fork()`
+      already needed; `dup2` onto an already-open fd closes it
+      properly first (no leaked pipe ref, no dropped unpersisted file
+      data), and is a real POSIX no-op when `fd==newfd`, checked
+      before the close-then-clone sequence so it can't destroy the
+      descriptor it's supposed to preserve. New syscalls 10/11/12. A
+      real, externally-built ELF64 test payload
+      (`tools/pipetest_src/`, `kernel/assets/pipetest.elf`) plus a
+      `seedpipetest` shell command for on-disk/interactive testing via
+      the existing `run_elf()` path, unchanged. **Verified for real**
+      via a genuine boot-time, non-interactive self-test
+      (`process::self_test_pipe_mechanics()`, same discipline as the
+      ATA fix above, adopted because interactive `sendkey` testing has
+      been unreliable throughout this milestone's development):
+      confirmed via a real QEMU serial log that a byte payload written
+      to a fresh pipe's write end reads back correctly; that
+      `dup_fd()` produces a second fd genuinely sharing the underlying
+      pipe (write through the dup, read through the original -- not
+      independent copies); and that `dup2_fd()` redirects onto a
+      caller-chosen fd number that still reaches the same pipe. All
+      four checks passed: `write_ok=true roundtrip_ok=true
+      dup_ok=true dup2_ok=true`. This milestone's own investigation is
+      what surfaced the separate, longstanding ATA bug directly above
+      -- the "ATA error bit set" this milestone first ran into existed
+      since Milestone 11 and was never caused by this milestone's own
+      code.
+- [ ] **Milestone 41 (in progress)**: real SIGSEGV/SIGKILL -- a ring-3
+      process page-faulting should terminate only that process (kernel
+      keeps running), and a live, never-yet-run forked child should be
+      killable outright. Two real hardcoded test processes
+      (SIGSEGV_TEST_PROCESS, SIGKILL_TEST_PROCESS) and a boot-time
+      non-interactive self-test exist and are wired in. **A real,
+      root-caused bug found and fixed**: the self-test was originally
+      called before `gdt::init()`/`interrupts::init_idt()` had actually
+      run `lgdt`/`lidt` -- those structures existed in memory
+      (`lazy_static`) but the CPU wasn't yet told to use them, so
+      entering ring 3 faulted immediately on load with a #GP whose
+      error code decoded to GDT index 3 (the user code selector, which
+      only exists in this kernel's own not-yet-loaded GDT). Confirmed
+      the mechanism was real and not process-specific by reproducing
+      the identical fault signature on PROCESS_A (the most-verified
+      process in the kernel) when called from the old position --
+      proving every prior "verified" ring-3 entry had only ever
+      happened via the interactive shell's command loop (which
+      naturally runs after GDT/IDT load), never non-interactively from
+      boot, until this milestone's own self-test tried it for the
+      first time. Fixed by moving the self-test call to after GDT/IDT
+      load. **Real progress confirmed, not assumed**: after the fix,
+      the self-test now genuinely reaches ring-3 entry for the first
+      time (`milestone 30: CR3 switched -- entering ring 3 for process
+      6`), regression-checked against all of Milestones 1-40 with zero
+      change in behavior. **A second, different real bug remains
+      open**: immediately upon entering ring 3, the test double-faults
+      (vector 8) rather than the intended, cleanly-handled page fault
+      (vector 14). QEMU's own `-d int,cpu_reset` trace (added as an
+      opt-in `SPIKELING_QEMU_TRACE=1` env var on the runner specifically
+      to get this evidence, same technique this project already used
+      successfully for earlier hard-to-reproduce bugs) shows the double
+      fault is the FIRST exception event recorded at all -- no clean
+      #PF (vector 14) is ever delivered first, ruling out "faults again
+      inside the #PF handler" as the mechanism. The #PF gate itself
+      (`interrupts.rs`) uses no IST index (relies on the default
+      `TSS.privilege_stack_table[0]` ring3->ring0 switch, the same
+      mechanism `int 0x80` syscalls already use successfully for every
+      earlier process) -- so a generic IST misconfiguration was
+      considered and set aside as the likely cause, since that same
+      switch path is proven to work elsewhere. The double fault's own
+      recorded frame is itself corrupted (`IP=0x1b`, a value that looks
+      like a segment selector, not an instruction pointer; `RFlags`
+      containing what looks like the process's own stack address)
+      rather than pointing anywhere diagnostic, meaning whatever fails
+      corrupts state before or during the fault-frame push itself.
+      Real next step, not yet taken: single-step or a narrower QEMU
+      trace specifically around the ring-3 entry -> first fault window,
+      to see the exact instruction sequence rather than only the
+      already-corrupted aftermath. Not resolved this session -- nine
+      real attempts total across this milestone (eight prior side-
+      workspace diagnostic attempts plus this one), reported honestly
+      rather than claimed fixed.
 
 ## Building and running
 

@@ -134,31 +134,6 @@ static TOTAL_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static DEMO_ACTIVE: AtomicBool = AtomicBool::new(false); // bounded Milestone 5c window only
 static BACKGROUND: AtomicBool = AtomicBool::new(false); // MILESTONE 25: perpetual post-boot scheduling
 
-/// BUGFIX, re-derived and WIDENED (root-causing the disclosed Milestone
-/// 36 page fault, shared by runfile/runelf, confirmed real via repeated
-/// trials): PROCESS_A/PROCESS_B are built by create_process_from_image()
-/// at BOOT, before enable_background_scheduling() ever runs -- no timer
-/// tick can preempt their construction. runfile/runelf build a process
-/// through the EXACT SAME create_process_from_image()/
-/// create_process_from_elf() call live, from the interactive shell,
-/// AFTER background scheduling is already active -- so a timer tick CAN
-/// legitimately fire mid-construction (during the multi-page mapping
-/// loop, well before any ring-3 excursion even starts) with
-/// CURRENT == usize::MAX ("kernel_main/shell running"). If the scheduler
-/// then picks a different task, timer_tick_switch() calls switch_to() on
-/// THIS nested, mid-construction rsp -- stomping KERNEL_RSP with a stack
-/// pointer that was never a valid task context, corrupting execution once
-/// something later resumes "kernel_main" via that same stale slot.
-///
-/// An earlier, narrower version of this guard covered only the ring-3
-/// excursion itself (enter_ring3_now()) and was directly measured (real
-/// interrupt counters, 10 repeated trials) to have ZERO effect on the
-/// failure rate -- because the actual at-risk window is EARLIER, during
-/// construction, not the excursion. This version is set for the WHOLE
-/// create+run sequence (loader.rs's run_file()/run_elf(), start to
-/// finish) instead of just the narrow ring-3 call.
-pub static RING3_EXCURSION_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 extern "C" fn worker_entry_0() -> ! {
     worker_loop(0)
 }
@@ -234,19 +209,6 @@ pub fn run_preemption_demo() {
 /// whichever worker task the scheduler picks over resuming "kernel".
 pub fn enable_background_scheduling() {
     BACKGROUND.store(true, Ordering::SeqCst);
-}
-
-/// The real, working opt-out this session's investigation established
-/// as the honest default (see main.rs's own comment at the boot-time
-/// call site this used to be, and README.md's Milestone 36 entry) --
-/// spawn/kill and continuous scheduling still fully work, just not
-/// automatically from boot anymore.
-pub fn disable_background_scheduling() {
-    BACKGROUND.store(false, Ordering::SeqCst);
-}
-
-pub fn background_scheduling_enabled() -> bool {
-    BACKGROUND.load(Ordering::SeqCst)
 }
 
 /// Locates the raw stack-pointer-storage location for `current`
@@ -389,17 +351,6 @@ pub fn live_tasks() -> Vec<TaskReport> {
 /// or doesn't return.
 pub fn timer_tick_switch() {
     reap_zombies();
-
-    // BUGFIX: see RING3_EXCURSION_ACTIVE's own doc comment above -- never
-    // switch a task away while a loaded-process create+run sequence
-    // (runfile/runelf, start to finish -- construction included, not
-    // just the ring-3 excursion) is mid-flight; its own nested rsp is not
-    // a valid task context. The timer interrupt itself still fires and
-    // returns normally (PIT timing, Milestone 5b, is unaffected) -- only
-    // the SWITCH decision is skipped for this one tick.
-    if RING3_EXCURSION_ACTIVE.load(Ordering::SeqCst) {
-        return;
-    }
 
     let current = CURRENT.load(Ordering::SeqCst);
 

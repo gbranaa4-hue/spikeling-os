@@ -76,6 +76,8 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write;
+use crate::serial;
 
 const DIR_LBA: u32 = 1;
 const MAX_ENTRIES: usize = 8;
@@ -374,6 +376,41 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     }
     data.truncate(entry.len as usize);
     Ok(data)
+}
+
+/// Real, boot-time, non-interactive proof that write_file()/read_file()
+/// actually reach the disk -- every prior "verified" disk write in this
+/// kernel's history relied on an interactive shell command (`write`,
+/// `seedfdtest`, `seedtestelf`, `seedpipetest`), all gated on QEMU's
+/// `sendkey` reaching the guest. This exercises the exact same
+/// write_file()/read_file() path with zero interactive input, so a
+/// broken sendkey path (or a missing secondary-ATA-drive QEMU argument,
+/// the drive write_file/read_file's ata::write_sector/read_sector calls
+/// actually depend on) shows up in the boot serial log on every single
+/// run, not just when someone remembers to test it by hand.
+pub fn self_test_disk_write() {
+    const PATH: &str = "selftestwrite";
+    const CONTENT: &[u8] = b"fs self-test disk write/read roundtrip";
+    let result = write_file(PATH, CONTENT).and_then(|_| read_file(PATH));
+    match result {
+        Ok(bytes) if bytes == CONTENT => {
+            let _ = writeln!(
+                serial(),
+                "fs self-test: disk write+read roundtrip OK -- real bytes matched"
+            );
+        }
+        Ok(bytes) => {
+            let _ = writeln!(
+                serial(),
+                "fs self-test: disk write+read MISMATCH -- wrote {} bytes, read back {} bytes",
+                CONTENT.len(),
+                bytes.len()
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "fs self-test: disk write+read FAILED -- {e}");
+        }
+    }
 }
 
 pub fn delete_file(path: &str) -> Result<(), String> {

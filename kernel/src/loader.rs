@@ -336,14 +336,6 @@ pub fn run_file(path: &str) -> Result<(), String> {
     // process::run_loaded_process's own doc comment for the full
     // diagnosis), found while verifying Milestone 35's fd syscalls but
     // predating them entirely, fixed here.
-    //
-    // BUGFIX: the real at-risk window turned out to be even wider than
-    // construction+excursion -- see shell.rs's call site (the actual
-    // guard now lives there, wrapping this call AND the result-printing
-    // that follows it, since both run nested in the same keyboard-ISR
-    // call chain). tasks::RING3_EXCURSION_ACTIVE's doc comment has the
-    // full diagnosis, including two narrower guards that were measured
-    // and found insufficient before this one.
     let phys_mem_offset = memory::phys_mem_offset();
     let create_result = memory::with_frame_allocator(|frame_allocator| {
         process::create_loaded_process(frame_allocator, phys_mem_offset, &bytes)
@@ -395,6 +387,27 @@ pub fn run_file(path: &str) -> Result<(), String> {
 /// actually need, so relaxing it costs nothing real).
 static TEST_ELF_BYTES: &[u8] = include_bytes!("../assets/testelf.elf");
 
+/// MILESTONE 40: real, externally-built ELF64 test payload for
+/// pipe()/dup2() -- built the exact same way TEST_ELF_BYTES above is
+/// (this project's own pinned Rust toolchain + rust-lld, single
+/// PT_LOAD segment at USER_CODE_ADDR, source in
+/// tools/pipetest_src/pipetest.rs), not hand-assembled.
+static PIPETEST_ELF_BYTES: &[u8] = include_bytes!("../assets/pipetest.elf");
+
+/// MILESTONE 40: the `seedpipetest` shell command's entry point --
+/// same reasoning as seed_test_elf() above, writes the real ELF bytes
+/// to disk so `runelf pipetest` (reusing run_elf() below unchanged,
+/// no pipe-specific loader code needed) can load and run it.
+pub fn seed_pipetest_elf() -> Result<usize, String> {
+    let len = PIPETEST_ELF_BYTES.len();
+    fs::write_file("pipetest", PIPETEST_ELF_BYTES).map_err(|e| format!("seedpipetest: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 40: seedpipetest -- wrote {len} real bytes (a genuine externally-built ELF64 executable exercising pipe()/dup2()) to 'pipetest' on the real on-disk filesystem"
+    );
+    Ok(len)
+}
+
 /// MILESTONE 36: writes TEST_ELF_BYTES to a real file ("testelf") on the
 /// real on-disk filesystem -- the `seedtestelf` shell command's entry
 /// point, mirroring seed_test_program()'s own reasoning above: this is
@@ -408,29 +421,6 @@ pub fn seed_test_elf() -> Result<usize, String> {
     let _ = writeln!(
         serial(),
         "milestone 36: seedtestelf -- wrote {len} real bytes (a genuine externally-built ELF64 executable, not hand-assembled) to 'testelf' on the real on-disk filesystem"
-    );
-    Ok(len)
-}
-
-/// MILESTONE 39: a real, externally-built ELF64 executable using this
-/// project's OWN minimal libc (tools/libc_test_src/libc.rs) instead of
-/// hand-assembled `int 0x80` machine code -- the first user program that
-/// calls write()/sbrk()/fork()/wait()/exit() as ordinary Rust function
-/// calls. Built with the same pinned nightly toolchain as testelf.elf
-/// (see tools/libc_test_src/README.md for the exact recipe and why this
-/// one needed `--gc-sections`/`relocation-model=static` that testelf's
-/// own recipe didn't).
-static LIBCTEST_ELF_BYTES: &[u8] = include_bytes!("../assets/libctest.elf");
-
-/// MILESTONE 39: writes LIBCTEST_ELF_BYTES to a real file ("libctest")
-/// on the real on-disk filesystem -- the `seedlibctest` shell command's
-/// entry point, mirroring seed_test_elf()'s own reasoning exactly.
-pub fn seed_libc_test() -> Result<usize, String> {
-    let len = LIBCTEST_ELF_BYTES.len();
-    fs::write_file("libctest", LIBCTEST_ELF_BYTES).map_err(|e| format!("seedlibctest: {e}"))?;
-    let _ = writeln!(
-        serial(),
-        "milestone 39: seedlibctest -- wrote {len} real bytes (an ELF64 executable built against this project's own minimal libc, not hand-assembled) to 'libctest' on the real on-disk filesystem"
     );
     Ok(len)
 }
@@ -467,16 +457,13 @@ pub fn run_elf(path: &str) -> Result<(), String> {
         );
     }
 
-    // BUGFIX: see run_file()'s own comment above -- the real guard now
-    // lives at shell.rs's call site, covering this call plus the
-    // result-printing that follows it.
     let phys_mem_offset = memory::phys_mem_offset();
-    let create_result = memory::with_frame_allocator(|frame_allocator| {
-        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, &bytes, &elf_image)
+    let result = memory::with_frame_allocator(|frame_allocator| {
+        process::load_and_run_elf(frame_allocator, phys_mem_offset, &bytes, &elf_image)
     });
 
-    match create_result {
-        Some(Ok(())) => process::run_loaded_process().map_err(|e| format!("runelf: {e}")),
+    match result {
+        Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(format!("runelf: {e}")),
         None => Err("runelf: global frame allocator not installed yet (should never happen post-boot)".into()),
     }

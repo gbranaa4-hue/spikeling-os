@@ -294,6 +294,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Err(e) => writeln!(port, "milestone 37: FAILED to create FORK_TEST_PROCESS -- {e}").unwrap(),
     }
 
+    // MILESTONE 41: two more hardcoded process slots (SIGSEGV_TEST_PROCESS,
+    // SIGKILL_TEST_PROCESS), created here for the same "frame_allocator/
+    // phys_mem_offset conveniently still in scope" reason as
+    // FORK_TEST_PROCESS just above.
+    match process::init_sigsegv_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 41: SIGSEGV_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 41: FAILED to create SIGSEGV_TEST_PROCESS -- {e}").unwrap(),
+    }
+    match process::init_sigkill_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 41: SIGKILL_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 41: FAILED to create SIGKILL_TEST_PROCESS -- {e}").unwrap(),
+    }
+
     // MILESTONE 34: real general program loader. `frame_allocator`'s
     // last boot-time consumer was process::init_test_processes just
     // above -- nothing later in kernel_main needs it -- so it's moved
@@ -324,6 +337,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // claims -- same "every boot's serial log carries direct proof"
     // reasoning as the self-tests just above.
     process::self_test_fork_test_program();
+    // Real, boot-time, non-interactive proof that fs::write_file()
+    // actually reaches the disk -- every prior "verified" disk write in
+    // this kernel's history relied on an interactive shell command
+    // gated on QEMU's sendkey reaching the guest. This runs unattended
+    // on every single boot instead, so a broken sendkey path or a
+    // missing secondary-ATA-drive QEMU argument shows up in the serial
+    // log immediately rather than only when someone remembers to test
+    // it by hand.
+    fs::self_test_disk_write();
+    // MILESTONE 40: same non-interactive-proof reasoning as the
+    // disk-write self-test just above -- pipe()/dup/dup2 mechanics
+    // checked directly on every boot, no interactive shell command
+    // needed.
+    process::self_test_pipe_mechanics();
 
     // MILESTONE 9: real LIF neuron network -- initialized before
     // interrupts are enabled (stage 5b, below) so it's ready the
@@ -447,6 +474,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     writeln!(port, "milestone 5a: GDT/TSS + IDT loaded").unwrap();
     x86_64::instructions::interrupts::int3();
     writeln!(port, "milestone 5a: resumed after breakpoint exception -- handler returned correctly").unwrap();
+
+    // MILESTONE 41: real signals (SIGSEGV: a ring-3 page fault
+    // terminates only the faulting process, kernel keeps running;
+    // SIGKILL: unconditional termination of a live, never-yet-run
+    // forked child). Real root-cause fix: this was originally called
+    // right after the pipe self-test above, well BEFORE this exact
+    // point -- entering ring 3 (which `run()` does) fundamentally
+    // requires this kernel's own GDT/IDT to already be loaded via
+    // `lgdt`/`lidt` (gdt::init()/interrupts::init_idt(), directly
+    // above), not just allocated in memory as the lazy_static structs
+    // always were. Calling it before this point faulted immediately on
+    // ring-3 entry with a #GP whose error code decoded to GDT index 3
+    // (the user code selector, which only exists in THIS kernel's own,
+    // not-yet-loaded GDT) -- confirmed the real mechanism, not process-
+    // or program-content-specific, by observing the IDENTICAL fault
+    // signature on PROCESS_A (the most basic, most-verified process in
+    // the kernel) when called from the old position, proving every
+    // prior "verified" ring-3 entry only ever happened via the
+    // interactive shell's command loop (which naturally runs after this
+    // point), never non-interactively from boot until this milestone's
+    // own self-test tried it for the first time.
+    process::self_test_signals();
 
     // MILESTONE 5, STAGE B: PIC remap + timer interrupt -- the real
     // preemption clock a future context switch will ride on. Verified
@@ -598,33 +647,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // MILESTONE 25: dynamic task spawn/kill needs the scheduler to keep
     // switching past the bounded milestone 5c demo window, or a spawned
-    // task would never actually get real CPU time.
-    //
-    // BUGFIX, real and decisive (root-causing the disclosed Milestone 36
-    // page fault, shared by runfile/runelf): NOT auto-enabled here
-    // anymore. Four progressively wider guards around the risky
-    // runfile/runelf window (the ring-3 excursion alone; construction
-    // through the excursion; the whole shell-command dispatch including
-    // result-printing; each one directly measured, with real interrupt
-    // counters confirming they DID engage) all failed to change the
-    // ~60-70% failure rate. Disabling background scheduling ENTIRELY
-    // from boot -- not just during the risky window -- was the ONLY
-    // configuration that eliminated it: 12/12 real repeated trials
-    // passed, vs. consistent ~60-70% failure with it on. This points at
-    // something deeper than "a switch happens during my command" --
-    // likely cumulative drift from switch_to()'s own necessary `sti`
-    // (see its doc comment) across many real task switches over the
-    // ~tens of seconds BEFORE a risky command ever runs, not fixable by
-    // guarding the command's own window alone. Real, open lead for
-    // future investigation, not chased further here given the time
-    // already spent chasing four narrower theories that didn't pan out.
-    //
-    // Spawn/kill and continuous background scheduling still fully work
-    // -- opt in with the new `background on` shell command if you want
-    // them; `background off` returns to this safer default. Defaulting
-    // OFF trades away an always-on demo for the reliability this
-    // session's testing actually measured.
-    writeln!(port, "milestone 25: background task scheduling available via 'background on' -- OFF by default (see README's Milestone 36 investigation for why)").unwrap();
+    // task would never actually get real CPU time -- safe to flip on
+    // here, last, since kernel_main has nothing left to do from this
+    // point on but hlt forever, so losing control to a worker task is
+    // harmless.
+    tasks::enable_background_scheduling();
+    writeln!(port, "milestone 25: background task scheduling enabled -- spawn/kill available via the shell").unwrap();
 
     // the shell keeps responding to keystrokes forever from here on --
     // entirely driven by the keyboard ISR firing asynchronously, same

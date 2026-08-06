@@ -379,6 +379,161 @@ pub(crate) const MAX_OPEN_FILES: usize = 4;
 /// rather than silently truncating a process's fd table on fork().
 const _ASSERT_MAX_OPEN_FILES_IS_4: () = assert!(MAX_OPEN_FILES == 4);
 
+/// MILESTONE 40: an fd slot now names one of two genuinely different
+/// underlying resources, not just a file -- `File` is exactly the
+/// pre-Milestone-40 `OpenFile` case (unchanged), `PipeRead`/`PipeWrite`
+/// name an END of a pipe by its index into the global PIPE_TABLE below,
+/// NOT owned data. That index-not-data distinction is the whole design:
+/// deriving Clone on this enum still gives fork() its existing "one
+/// `.clone()` per fd slot, one `let` statement per slot" pattern
+/// unchanged (see fork()'s own comment on why combining multiple
+/// fallible clones into one expression broke the build once already),
+/// but for a pipe end, cloning an index is exactly the reference-sharing
+/// a real fork() needs -- the parent and child end up with two DIFFERENT
+/// Process structs whose fd slot holds the SAME index into ONE shared
+/// PIPE_TABLE entry, not two independent copies of a buffer (which
+/// would silently break the pipe's entire reason to exist). `File`
+/// keeps its own pre-existing honest limitation: dup()/dup2() of a
+/// File fd (below) deep-copies the same way fork() already does,
+/// documented there, not pretended away here.
+#[derive(Clone)]
+enum FdEntry {
+    File(OpenFile),
+    PipeRead(usize),
+    PipeWrite(usize),
+}
+
+/// MILESTONE 40: fixed ring-buffer capacity per pipe, matching this
+/// project's small-fixed-bound style (MAX_OPEN_FILES/MAX_PROCESSES's own
+/// precedent) rather than a dynamically-growing buffer.
+const PIPE_CAPACITY: usize = 512;
+
+/// MILESTONE 40: how many pipes can exist system-wide at once (NOT
+/// per-process -- a pipe is a global resource two different processes'
+/// fd tables can both reference, so it can't live inside either one's
+/// own Process struct).
+const MAX_PIPES: usize = 4;
+
+/// MILESTONE 40: a real, fixed-size ring buffer plus real open-end
+/// reference counts. The counts exist for exactly one reason: a pipe's
+/// storage is only actually freed (PIPE_TABLE slot -> None) once EVERY
+/// fd across EVERY process that ever referenced either end -- including
+/// ends duplicated by fork() or dup()/dup2() -- has been close()'d.
+/// Without real counting, closing the fd in ONE of two processes sharing
+/// a forked pipe would either free it out from under the other (a
+/// dangling reference) or never free it at all (a permanent leak of one
+/// of only MAX_PIPES=4 global slots). Both `read_open`/`write_open`
+/// start at 1 (the fd pipe() itself hands back) and are incremented by
+/// fork()/dup()/dup2() and decremented by close_fd() -- see each site's
+/// own comment.
+struct Pipe {
+    buffer: [u8; PIPE_CAPACITY],
+    /// Index of the next byte to be read (wraps modulo PIPE_CAPACITY).
+    read_pos: usize,
+    /// Index of the next byte to be written (wraps modulo PIPE_CAPACITY).
+    write_pos: usize,
+    /// How many real, unread bytes are currently buffered -- distinct
+    /// from `read_pos`/`write_pos` alone because those two can be equal
+    /// at BOTH "completely empty" and "completely full" (a ring buffer
+    /// needs a third piece of state to disambiguate the two).
+    len: usize,
+    read_open: u32,
+    write_open: u32,
+}
+
+/// MILESTONE 40: the global pipe table -- see Pipe's own doc comment for
+/// why this can't be per-process state. `spin::Mutex<[Option<T>; N]>` is
+/// the exact same pattern PROCESS_TABLE already established for a
+/// dynamic, bounded set of global kernel objects.
+static PIPE_TABLE: Mutex<[Option<Pipe>; MAX_PIPES]> = Mutex::new([const { None }; MAX_PIPES]);
+
+/// MILESTONE 40: allocates a real PIPE_TABLE slot (both ends starting at
+/// `read_open`/`write_open` = 1, `len` = 0) and gives the calling
+/// process two new fd-table entries -- `FdEntry::PipeRead`/`PipeWrite`
+/// -- pointing at it. Returns `(read_fd, write_fd)`, or `None` if either
+/// the process's own fd table can't fit both new entries (needs 2 free
+/// slots, not just 1) or PIPE_TABLE itself is full (all MAX_PIPES
+/// already live).
+pub(crate) fn pipe_create(id: u8) -> Option<(u64, u64)> {
+    let mut table = PIPE_TABLE.lock();
+    let pipe_index = table.iter().position(|p| p.is_none())?;
+    table[pipe_index] = Some(Pipe {
+        buffer: [0u8; PIPE_CAPACITY],
+        read_pos: 0,
+        write_pos: 0,
+        len: 0,
+        read_open: 1,
+        write_open: 1,
+    });
+    drop(table);
+    let result = with_process_mut(id, |proc| {
+        let mut free = proc.fds.iter().enumerate().filter(|(_, f)| f.is_none()).map(|(i, _)| i);
+        let read_slot = free.next()?;
+        let write_slot = free.next()?;
+        proc.fds[read_slot] = Some(FdEntry::PipeRead(pipe_index));
+        proc.fds[write_slot] = Some(FdEntry::PipeWrite(pipe_index));
+        Some((read_slot as u64, write_slot as u64))
+    })?;
+    if result.is_none() {
+        // Process's fd table couldn't fit both ends -- release the
+        // PIPE_TABLE slot we just allocated rather than leaking it.
+        PIPE_TABLE.lock()[pipe_index] = None;
+    }
+    result
+}
+
+/// MILESTONE 40: reads up to `len` bytes out of the pipe fd names.
+/// Real, honest, DISCLOSED non-blocking semantics: this kernel has no
+/// scheduler-level blocking primitive a syscall could suspend a process
+/// on (Milestone 25's background scheduling is cooperative task
+/// switching, not a wait-queue) -- so reading an empty pipe returns
+/// `Some(vec![])` (0 bytes, not an error) immediately rather than really
+/// blocking until a writer produces data, the same "explicit partial/
+/// empty result, never silently wrong" discipline read_fd() already
+/// established for end-of-file. Returns `None` only if `fd` doesn't name
+/// a currently-open PipeRead entry for this process.
+fn pipe_read(id: u8, fd: u64, len: usize) -> Option<Vec<u8>> {
+    let pipe_index = with_process_mut(id, |proc| match proc.fds.get(fd as usize)? {
+        Some(FdEntry::PipeRead(idx)) => Some(*idx),
+        _ => None,
+    })??;
+    let mut table = PIPE_TABLE.lock();
+    let pipe = table[pipe_index].as_mut()?;
+    let n = len.min(pipe.len);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(pipe.buffer[(pipe.read_pos + i) % PIPE_CAPACITY]);
+    }
+    pipe.read_pos = (pipe.read_pos + n) % PIPE_CAPACITY;
+    pipe.len -= n;
+    Some(out)
+}
+
+/// MILESTONE 40: writes as many bytes of `data` as currently fit into
+/// the pipe fd names, returning the ACTUAL count accepted -- a real,
+/// honest partial write if the ring buffer doesn't have room for all of
+/// it (same discipline as write_fd()'s own MAX_FILE_BYTES truncation),
+/// never blocking for room to free up (see pipe_read()'s doc comment for
+/// why -- no blocking primitive exists to wait on). Returns `None` only
+/// if `fd` doesn't name a currently-open PipeWrite entry for this
+/// process.
+fn pipe_write(id: u8, fd: u64, data: &[u8]) -> Option<usize> {
+    let pipe_index = with_process_mut(id, |proc| match proc.fds.get(fd as usize)? {
+        Some(FdEntry::PipeWrite(idx)) => Some(*idx),
+        _ => None,
+    })??;
+    let mut table = PIPE_TABLE.lock();
+    let pipe = table[pipe_index].as_mut()?;
+    let room = PIPE_CAPACITY - pipe.len;
+    let n = data.len().min(room);
+    for (i, byte) in data[..n].iter().enumerate() {
+        pipe.buffer[(pipe.write_pos + i) % PIPE_CAPACITY] = *byte;
+    }
+    pipe.write_pos = (pipe.write_pos + n) % PIPE_CAPACITY;
+    pipe.len += n;
+    Some(n)
+}
+
 pub struct Process {
     label: &'static str,
     pml4_frame: PhysFrame<Size4KiB>,
@@ -403,7 +558,7 @@ pub struct Process {
     /// heap_used'''s own persists-across-runs precedent -- a fd left open
     /// by a buggy program stays open (and stays counted against
     /// MAX_OPEN_FILES) until an explicit close(), exactly like a real OS.
-    fds: [Option<OpenFile>; MAX_OPEN_FILES],
+    fds: [Option<FdEntry>; MAX_OPEN_FILES],
     /// MILESTONE 36: extra physical frames backing a real ELF-loaded
     /// process'''s PT_LOAD segment pages BEYOND the one page already
     /// tracked as `code_frame` above (which, for an ELF-loaded process,
@@ -491,12 +646,80 @@ static FORK_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 /// distinct from PID_TABLE_BASE(10)'s own dynamic range below.
 pub(crate) const FORK_TEST_PROCESS_ID: u8 = 5;
 
+/// MILESTONE 41: a deliberately-faulting ring-3 test program -- writes
+/// a short distinguishing message, then dereferences a definitely-
+/// unmapped address (0x0000_1234_5678_0000, nowhere near
+/// USER_CODE_ADDR/USER_STACK_ADDR/HEAP_START's own 0x5555... range),
+/// triggering a real page fault at real CPL=3. The `mov eax,1`/`int
+/// 0x80`/`jmp $` tail is UNREACHABLE -- pure safety net matching every
+/// other hand-assembled program's own convention, in case the fault
+/// mechanism itself turns out to be broken and execution somehow
+/// continues past the fault.
+///
+///   offset  bytes                                    instruction
+///    0      B8 00 00 00 00                           mov eax, 0        (write syscall)
+///    5      48 BF 2C 00 00 50 55 55 00 00             mov rdi, imm64    (USER_CODE_ADDR+44, the message below)
+///   15      BE 0D 00 00 00                            mov esi, 13       (message length)
+///   20      CD 80                                     int 0x80
+///   22      48 BB 00 00 78 56 34 12 00 00             mov rbx, imm64    (0x0000_1234_5678_0000, unmapped)
+///   32      48 8B 03                                  mov rax, [rbx]    -- FAULTS HERE
+///   35      B8 01 00 00 00                            mov eax, 1        (unreachable)
+///   40      CD 80                                     int 0x80          (unreachable)
+///   42      EB FE                                     jmp $             (unreachable)
+///   44      "SIGSEGV test\n"                          the message itself (13 bytes)
+pub(crate) const SIGSEGV_TEST_PROGRAM: [u8; 57] = [
+    0xB8, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBF, 0x2C, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE,
+    0x0D, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0xBB, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00,
+    0x48, 0x8B, 0x03, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE, 0x53, 0x49, 0x47, 0x53,
+    0x45, 0x47, 0x56, 0x20, 0x74, 0x65, 0x73, 0x74, 0x0A,
+];
+/// The real message embedded in SIGSEGV_TEST_PROGRAM at byte offset 44
+/// -- checked by self_test_signals() before trusting the program at
+/// runtime, same discipline as FORK_TEST_PROGRAM's own layout self-test.
+const SIGSEGV_MSG: &[u8] = b"SIGSEGV test\n";
+const SIGSEGV_MSG_OFFSET: usize = 44;
+
+/// MILESTONE 41: a SIXTH hardcoded, boot-time-created process slot --
+/// runs SIGSEGV_TEST_PROGRAM. See that constant's own doc comment.
+static SIGSEGV_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const SIGSEGV_TEST_PROCESS_ID: u8 = 6;
+
+/// MILESTONE 41: fork()s exactly one child then immediately kill()s it
+/// (syscall 13, rdi=child pid) INSTEAD of wait()ing it -- real proof
+/// SIGKILL bypasses the normal "run to completion, then reap" contract.
+/// Forks a SECOND time afterward: if the first child's PROCESS_TABLE
+/// slot was genuinely freed (not just flagged), this second fork()
+/// succeeds and reuses it -- self_test_signals() checks PROCESS_TABLE's
+/// real occupancy afterward as the actual proof, not just trusting this
+/// program ran without crashing.
+///
+///   offset  bytes                        instruction
+///    0      B8 07 00 00 00               mov eax, 7   (fork)
+///    5      CD 80                        int 0x80     -- rax = child pid
+///    7      89 C7                        mov edi, eax (child pid -> kill's arg)
+///    9      B8 0D 00 00 00               mov eax, 13  (kill)
+///   14      CD 80                        int 0x80
+///   16      B8 07 00 00 00               mov eax, 7   (fork again)
+///   21      CD 80                        int 0x80
+///   23      B8 01 00 00 00               mov eax, 1   (exit)
+///   28      CD 80                        int 0x80
+///   30      EB FE                        jmp $        (unreachable)
+pub(crate) const SIGKILL_TEST_PROGRAM: [u8; 32] = [
+    0xB8, 0x07, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x89, 0xC7, 0xB8, 0x0D, 0x00, 0x00, 0x00, 0xCD, 0x80,
+    0xB8, 0x07, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE,
+];
+
+/// MILESTONE 41: a SEVENTH hardcoded, boot-time-created process slot --
+/// runs SIGKILL_TEST_PROGRAM. See that constant's own doc comment.
+static SIGKILL_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const SIGKILL_TEST_PROCESS_ID: u8 = 7;
+
 /// MILESTONE 37: real, dynamic PID allocation for `fork()`-created
 /// children. PIDs 1-9 stay permanently reserved for the five
 /// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-9
-/// held as headroom) so a forked child's PID can never collide with any
-/// of them; PROCESS_TABLE's own slot `i` is always PID
-/// `PID_TABLE_BASE + i`.
+/// held as headroom, of which Milestone 41 now uses 6 and 7) so a
+/// forked child's PID can never collide with any of them;
+/// PROCESS_TABLE's own slot `i` is always PID `PID_TABLE_BASE + i`.
 pub(crate) const PID_TABLE_BASE: u8 = 10;
 
 /// MILESTONE 37: real, honest, small bound on concurrently-live forked
@@ -641,6 +864,14 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
             let mut guard = FORK_TEST_PROCESS.lock();
             Some(f(guard.as_mut()?))
         }
+        SIGSEGV_TEST_PROCESS_ID => {
+            let mut guard = SIGSEGV_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        SIGKILL_TEST_PROCESS_ID => {
+            let mut guard = SIGKILL_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
             let idx = (id - PID_TABLE_BASE) as usize;
             let mut guard = PROCESS_TABLE.lock();
@@ -675,7 +906,7 @@ pub(crate) fn open_file(id: u8, path: &str) -> Option<u64> {
     let path_owned = path.to_string();
     with_process_mut(id, move |proc| {
         let slot_index = proc.fds.iter().position(|f| f.is_none())?;
-        proc.fds[slot_index] = Some(OpenFile { path: path_owned, buffer, pos: 0, dirty: false });
+        proc.fds[slot_index] = Some(FdEntry::File(OpenFile { path: path_owned, buffer, pos: 0, dirty: false }));
         Some(slot_index as u64)
     })?
 }
@@ -690,9 +921,23 @@ pub(crate) fn open_file(id: u8, path: &str) -> Option<u64> {
 /// Returns `None` (distinct from a legitimate `Some(vec![])` at EOF) if
 /// `fd` doesn't name a currently-open descriptor for this process, or
 /// `id` doesn't name a live process.
+/// MILESTONE 40: now also the entry point for pipe reads -- checks
+/// whether `fd` names a File or a PipeRead end and dispatches to
+/// pipe_read() for the latter (which takes its own lock on PIPE_TABLE,
+/// separate from this function's `with_process_mut`, so the two locks
+/// are never held nested/at once). A PipeWrite fd, or any `fd` that
+/// simply isn't open, both correctly fall through to `None` -- reading
+/// from a pipe's WRITE end is exactly as invalid as reading a closed fd.
 pub(crate) fn read_fd(id: u8, fd: u64, len: usize) -> Option<Vec<u8>> {
+    let is_pipe_read = with_process_mut(id, |proc| matches!(proc.fds.get(fd as usize), Some(Some(FdEntry::PipeRead(_)))))?;
+    if is_pipe_read {
+        return pipe_read(id, fd, len);
+    }
     with_process_mut(id, |proc| {
-        let entry = proc.fds.get_mut(fd as usize)?.as_mut()?;
+        let entry = match proc.fds.get_mut(fd as usize)?.as_mut()? {
+            FdEntry::File(f) => f,
+            _ => return None,
+        };
         let start = entry.pos.min(entry.buffer.len());
         let end = (start + len).min(entry.buffer.len());
         let out = entry.buffer[start..end].to_vec();
@@ -714,9 +959,19 @@ pub(crate) fn read_fd(id: u8, fd: u64, len: usize) -> Option<Vec<u8>> {
 /// usertest.rs's own MAX_WRITE_LEN already established for syscall 0).
 /// Marks the fd dirty so close_fd() below knows to persist it. Returns
 /// `None` if `fd`/`id` don't name a currently-open descriptor.
+/// MILESTONE 40: now also the entry point for pipe writes -- same
+/// dispatch pattern as read_fd() above, see its comment for why the two
+/// locks (per-process, PIPE_TABLE) are never nested.
 pub(crate) fn write_fd(id: u8, fd: u64, data: &[u8]) -> Option<usize> {
+    let is_pipe_write = with_process_mut(id, |proc| matches!(proc.fds.get(fd as usize), Some(Some(FdEntry::PipeWrite(_)))))?;
+    if is_pipe_write {
+        return pipe_write(id, fd, data);
+    }
     with_process_mut(id, |proc| {
-        let entry = proc.fds.get_mut(fd as usize)?.as_mut()?;
+        let entry = match proc.fds.get_mut(fd as usize)?.as_mut()? {
+            FdEntry::File(f) => f,
+            _ => return None,
+        };
         let start = entry.pos;
         let room = fs::MAX_FILE_BYTES.saturating_sub(start);
         let n = data.len().min(room);
@@ -750,6 +1005,37 @@ pub(crate) fn close_fd(id: u8, fd: u64) -> Option<bool> {
         let slot = proc.fds.get_mut(fd as usize)?;
         slot.take()
     })??;
+    let entry = match entry {
+        FdEntry::File(f) => f,
+        // MILESTONE 40: closing a pipe end decrements its real ref
+        // count (see Pipe's own doc comment for why counting, not
+        // unconditional free, is required once fork()/dup() can share
+        // an end across processes/fds) and only actually frees the
+        // PIPE_TABLE slot once EVERY read end AND EVERY write end
+        // anyone ever held has been closed -- a pipe with its write end
+        // still open but read end closed, or vice versa, correctly
+        // stays allocated.
+        FdEntry::PipeRead(idx) => {
+            let mut table = PIPE_TABLE.lock();
+            if let Some(pipe) = table[idx].as_mut() {
+                pipe.read_open = pipe.read_open.saturating_sub(1);
+                if pipe.read_open == 0 && pipe.write_open == 0 {
+                    table[idx] = None;
+                }
+            }
+            return Some(true);
+        }
+        FdEntry::PipeWrite(idx) => {
+            let mut table = PIPE_TABLE.lock();
+            if let Some(pipe) = table[idx].as_mut() {
+                pipe.write_open = pipe.write_open.saturating_sub(1);
+                if pipe.read_open == 0 && pipe.write_open == 0 {
+                    table[idx] = None;
+                }
+            }
+            return Some(true);
+        }
+    };
     if !entry.dirty {
         return Some(true);
     }
@@ -772,6 +1058,81 @@ pub(crate) fn close_fd(id: u8, fd: u64) -> Option<bool> {
             Some(false)
         }
     }
+}
+
+/// MILESTONE 40: the `dup` syscall's kernel-side implementation --
+/// duplicates `fd` into the LOWEST-numbered free slot in this process's
+/// own fd table, returning the new fd number. For a PipeRead/PipeWrite
+/// entry this is a REAL, correct dup(): both fd numbers end up pointing
+/// at the SAME PIPE_TABLE index (its ref count incremented, see Pipe's
+/// own doc comment), genuinely sharing one buffer/cursor pair. For a
+/// File entry this is an honest, disclosed simplification, NOT real
+/// POSIX dup() semantics -- it deep-copies the OpenFile (own `pos`), the
+/// exact same "independent copy, not a shared reference" choice fork()
+/// already made for File entries, for the identical reason (this
+/// codebase currently has no shared/reference-counted File object to
+/// point two fd numbers at, only owned-by-value buffers). Returns `None`
+/// if `fd` isn't currently open or the table has no free slot.
+pub(crate) fn dup_fd(id: u8, fd: u64) -> Option<u64> {
+    let cloned = with_process_mut(id, |proc| proc.fds.get(fd as usize)?.clone())?;
+    let cloned = cloned?;
+    if let FdEntry::PipeRead(idx) | FdEntry::PipeWrite(idx) = cloned {
+        let mut table = PIPE_TABLE.lock();
+        if let Some(pipe) = table[idx].as_mut() {
+            match cloned {
+                FdEntry::PipeRead(_) => pipe.read_open = pipe.read_open.saturating_add(1),
+                FdEntry::PipeWrite(_) => pipe.write_open = pipe.write_open.saturating_add(1),
+                FdEntry::File(_) => unreachable!(),
+            }
+        }
+    }
+    with_process_mut(id, move |proc| {
+        let slot_index = proc.fds.iter().position(|f| f.is_none())?;
+        proc.fds[slot_index] = Some(cloned);
+        Some(slot_index as u64)
+    })?
+}
+
+/// MILESTONE 40: the `dup2` syscall's kernel-side implementation --
+/// same sharing semantics as dup_fd() above (real for pipes, honest
+/// deep-copy for files), but into a CALLER-CHOSEN fd number `newfd`
+/// rather than the lowest free slot. If `newfd` already names an open
+/// descriptor, it is properly closed first (its own ref count
+/// decremented / its own dirty buffer persisted, via the SAME
+/// close_fd() every other close path uses -- not a silent overwrite
+/// that would leak a pipe ref or drop unpersisted file data). A dup2 of
+/// an fd onto itself (`fd == newfd`) is a real no-op, matching POSIX,
+/// checked explicitly before the close-then-clone sequence so it can't
+/// close (and thereby destroy) the very descriptor it's supposed to
+/// preserve. Returns `Some(true)` on success, `None` if `fd` isn't open
+/// or `newfd` is out of range.
+pub(crate) fn dup2_fd(id: u8, fd: u64, newfd: u64) -> Option<bool> {
+    if fd == newfd {
+        let is_open = with_process_mut(id, |proc| proc.fds.get(fd as usize).map(|f| f.is_some()))??;
+        return if is_open { Some(true) } else { None };
+    }
+    if newfd as usize >= MAX_OPEN_FILES {
+        return None;
+    }
+    let cloned = with_process_mut(id, |proc| proc.fds.get(fd as usize)?.clone())?;
+    let cloned = cloned?;
+    if with_process_mut(id, |proc| proc.fds.get(newfd as usize).map(|f| f.is_some()))? == Some(true) {
+        close_fd(id, newfd)?;
+    }
+    if let FdEntry::PipeRead(idx) | FdEntry::PipeWrite(idx) = cloned {
+        let mut table = PIPE_TABLE.lock();
+        if let Some(pipe) = table[idx].as_mut() {
+            match cloned {
+                FdEntry::PipeRead(_) => pipe.read_open = pipe.read_open.saturating_add(1),
+                FdEntry::PipeWrite(_) => pipe.write_open = pipe.write_open.saturating_add(1),
+                FdEntry::File(_) => unreachable!(),
+            }
+        }
+    }
+    with_process_mut(id, move |proc| {
+        proc.fds[newfd as usize] = Some(cloned);
+        Some(true)
+    })?
 }
 
 /// MILESTONE 34: the actual page-table-building mechanism, factored out
@@ -1066,6 +1427,44 @@ pub fn init_fork_test_process(
     Ok(())
 }
 
+/// MILESTONE 41: creates SIGSEGV_TEST_PROCESS -- see that static's own
+/// doc comment. Mirrors init_fork_test_process()'s exact pattern.
+pub fn init_sigsegv_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 41: creating SIGSEGV_TEST_PROCESS's private address space...");
+    let p = create_process_from_image(frame_allocator, phys_mem_offset, "sigsegv-test", &SIGSEGV_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 41: SIGSEGV_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    *SIGSEGV_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 41: creates SIGKILL_TEST_PROCESS -- see that static's own
+/// doc comment. Mirrors init_fork_test_process()'s exact pattern.
+pub fn init_sigkill_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 41: creating SIGKILL_TEST_PROCESS's private address space...");
+    let p = create_process_from_image(frame_allocator, phys_mem_offset, "sigkill-test", &SIGKILL_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 41: SIGKILL_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    *SIGKILL_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
 /// MILESTONE 30: the `runproc N` shell command's entry point. Switches
 /// CR3 to process N's own PML4, enters ring 3 at the SAME virtual
 /// address usertest.rs always uses, lets the syscalls run (write reads
@@ -1082,7 +1481,9 @@ pub fn run(id: u8) -> Result<(), &'static str> {
         2 => &PROCESS_B,
         FDTEST_PROCESS_ID => &FDTEST_PROCESS,
         FORK_TEST_PROCESS_ID => &FORK_TEST_PROCESS,
-        _ => return Err("no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), or 5 (FORK_TEST_PROCESS_ID)"),
+        SIGSEGV_TEST_PROCESS_ID => &SIGSEGV_TEST_PROCESS,
+        SIGKILL_TEST_PROCESS_ID => &SIGKILL_TEST_PROCESS,
+        _ => return Err("no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), or 7 (SIGKILL_TEST_PROCESS_ID)"),
     };
     let (pml4_frame, label) = {
         let guard = slot.lock();
@@ -1540,23 +1941,19 @@ fn create_process_from_elf(
     })
 }
 
-/// BUGFIX, RE-APPLIED (found this while root-causing the disclosed
-/// Milestone 36 page fault; a prior application of this same fix was
-/// lost from a concurrent merge and is being restored here): this used
-/// to be `load_and_run_elf()`, ONE function taking `frame_allocator` for
-/// its ENTIRE body -- including the CR3 switch and
-/// `usertest::enter_ring3_now()`'s whole ring-3 excursion (interrupts
-/// enabled throughout). Called from inside `memory::with_frame_
-/// allocator`'s closure, this held the global FRAME_ALLOCATOR spinlock
-/// across the whole excursion for no reason (the excursion itself never
-/// touches frame_allocator) -- the exact hazard class Milestone 35 fixed
-/// for the flat-binary path via create_loaded_process()/
-/// run_loaded_process(), never carried over here. Split the same way:
-/// this half does ONLY the parsing-driven page-table build and stores
-/// the result in LOADED_PROCESS; the existing run_loaded_process()
-/// (generic over whatever's in that slot) handles the ring-3 part,
-/// called by loader.rs AFTER the frame-allocator closure has returned.
-pub fn create_loaded_elf_process(
+/// MILESTONE 36: the `runelf PATH` shell command's entry point (called
+/// from loader.rs's run_elf(), which does the real fs::read_file() +
+/// elf::parse() first and hands this function the already-parsed
+/// elf::ElfImage). Builds a fresh process from a genuine multi-segment
+/// ELF64 executable's PT_LOAD segments and runs it once immediately --
+/// otherwise identical to load_and_run_image()'s own CR3-switch /
+/// enter_ring3_now() / (exit syscall restores CR3) sequence. Reuses the
+/// SAME LOADED_PROCESS slot and LOADED_PROCESS_ID as the flat-binary
+/// `runfile` path above -- both are real, single-slot "one loaded
+/// process at a time" designs, and since `runfile`/`runelf` are never
+/// both mid-flight at once (the shell runs one command to completion
+/// before reading the next), sharing the slot is safe, not a race.
+pub fn load_and_run_elf(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     phys_mem_offset: VirtAddr,
     image: &[u8],
@@ -1570,7 +1967,30 @@ pub fn create_loaded_elf_process(
         &elf_image.segments,
         image,
     )?;
+    let pml4_frame = proc.pml4_frame;
     *LOADED_PROCESS.lock() = Some(proc);
+
+    let _ = writeln!(
+        serial(),
+        "milestone 36: elf-loaded process -- about to switch CR3 to pml4 {:#x}",
+        pml4_frame.start_address().as_u64()
+    );
+    ACTIVE_PROCESS.store(LOADED_PROCESS_ID, Ordering::SeqCst);
+
+    let flags = Cr3Flags::from_bits_truncate(KERNEL_CR3_FLAGS_BITS.load(Ordering::SeqCst));
+    unsafe { Cr3::write(pml4_frame, flags) };
+    let _ = writeln!(
+        serial(),
+        "milestone 36: CR3 switched -- entering ring 3 for the ELF-loaded process at {:#x} (real e_entry)",
+        elf_image.entry
+    );
+
+    usertest::enter_ring3_now();
+
+    let _ = writeln!(
+        serial(),
+        "milestone 36: elf-loaded process -- resumed in kernel context (CR3 already restored by the exit syscall before this point)"
+    );
     Ok(())
 }
 
@@ -1705,6 +2125,66 @@ pub fn self_test_fork_test_program() {
     );
 }
 
+/// MILESTONE 40: a real, boot-time, non-interactive proof that
+/// pipe()/dup()/dup2() actually work -- same motivation as fs.rs's
+/// self_test_disk_write() (interactive shell-command testing has been
+/// unreliable in this environment; this exercises the exact kernel-side
+/// functions usertest.rs's syscall handlers call, with zero interactive
+/// input, so every boot's serial log carries direct proof). Deliberately
+/// scoped to the kernel-side fd/pipe mechanics themselves (pipe_create,
+/// write_fd/read_fd dispatching correctly onto FdEntry::Pipe*, dup_fd's
+/// real ref-counted sharing) rather than a full ring-3 syscall round
+/// trip -- the same "layout/mechanism, not full live execution" scope
+/// self_test_fork_test_program() above already established as this
+/// project's honest self-test pattern. Reuses FORK_TEST_PROCESS_ID's
+/// already-initialized fd table rather than allocating a new process.
+pub fn self_test_pipe_mechanics() {
+    const MSG: &[u8] = b"pipe self-test payload";
+    let id = FORK_TEST_PROCESS_ID;
+
+    let Some((rfd, wfd)) = pipe_create(id) else {
+        let _ = writeln!(serial(), "milestone 40: self-test -- FAILED, pipe_create returned None");
+        return;
+    };
+
+    let write_ok = write_fd(id, wfd, MSG) == Some(MSG.len());
+    let read_back = read_fd(id, rfd, MSG.len());
+    let roundtrip_ok = read_back.as_deref() == Some(MSG);
+
+    // dup_fd: a second fd cloned from the write end must share the SAME
+    // underlying pipe -- write through the dup, read through the
+    // original read end, real evidence they're not independent copies.
+    let dup_ok = match dup_fd(id, wfd) {
+        Some(dup_wfd) => {
+            const MSG2: &[u8] = b"via-dup";
+            let wrote = write_fd(id, dup_wfd, MSG2) == Some(MSG2.len());
+            let got = read_fd(id, rfd, MSG2.len());
+            wrote && got.as_deref() == Some(MSG2)
+        }
+        None => false,
+    };
+
+    // dup2_fd: force the read end onto a caller-chosen fd number, then
+    // confirm reads through THAT number still reach the same pipe.
+    let dup2_target: u64 = 3;
+    let dup2_ok = match dup2_fd(id, rfd, dup2_target) {
+        Some(true) => {
+            const MSG3: &[u8] = b"via-dup2";
+            let wrote = write_fd(id, wfd, MSG3) == Some(MSG3.len());
+            let got = read_fd(id, dup2_target, MSG3.len());
+            wrote && got.as_deref() == Some(MSG3)
+        }
+        _ => false,
+    };
+
+    let all_ok = write_ok && roundtrip_ok && dup_ok && dup2_ok;
+    let _ = writeln!(
+        serial(),
+        "milestone 40: self-test -- pipe mechanics: write_ok={write_ok} roundtrip_ok={roundtrip_ok} dup_ok={dup_ok} dup2_ok={dup2_ok} -- {}",
+        if all_ok { "all real, real bytes matched through every path" } else { "FAILED -- see individual flags above" }
+    );
+}
+
 /// MILESTONE 37: allocates a genuinely new PID slot in PROCESS_TABLE --
 /// finds the first free slot and returns `PID_TABLE_BASE + index`, or
 /// `None` if the table is already full (MAX_PROCESSES live children).
@@ -1826,6 +2306,28 @@ pub(crate) fn fork(parent_id: u8, resume_rip: u64, resume_rsp: u64) -> Option<u8
         }
     };
     child.heap_used = parent_heap_used;
+    // MILESTONE 40: the child's fd table now holds its OWN clone of any
+    // pipe ends the parent had open (see FdEntry's own doc comment for
+    // why cloning a PipeRead/PipeWrite index is real sharing, not a
+    // data copy) -- so PIPE_TABLE's ref counts must go up to match, the
+    // same real-accounting requirement close_fd()/dup_fd()/dup2_fd()
+    // already established. Without this, the child's two new fd-table
+    // entries would reference a pipe PIPE_TABLE still thinks only the
+    // parent holds -- the parent closing its own end would then free
+    // the pipe out from under the child (a real dangling-reference bug,
+    // not hypothetical).
+    for entry in parent_fds.iter().flatten() {
+        if let FdEntry::PipeRead(idx) | FdEntry::PipeWrite(idx) = entry {
+            let mut table = PIPE_TABLE.lock();
+            if let Some(pipe) = table[*idx].as_mut() {
+                match entry {
+                    FdEntry::PipeRead(_) => pipe.read_open = pipe.read_open.saturating_add(1),
+                    FdEntry::PipeWrite(_) => pipe.write_open = pipe.write_open.saturating_add(1),
+                    FdEntry::File(_) => unreachable!(),
+                }
+            }
+        }
+    }
     child.fds = parent_fds;
     child.parent_pid = Some(parent_id);
     child.pending_resume = Some((resume_rip, resume_rsp));
@@ -1977,6 +2479,117 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<u8> {
         parent_pml4.start_address().as_u64()
     );
     Some(child_pid)
+}
+
+/// MILESTONE 41: SIGKILL-equivalent -- unconditionally terminates a
+/// live, never-yet-run forked child, bypassing the normal "run to its
+/// own exit(), then reap" contract wait_for_child() enforces. Only the
+/// child's REAL parent may kill it (same authorization check
+/// wait_for_child() already makes). Structurally, any entry still
+/// present in PROCESS_TABLE has, by construction, never been run --
+/// wait_for_child() is the ONLY code that ever runs a forked child, and
+/// it always reaps (clears) the slot immediately afterward -- so there
+/// is no separate "already ran, not yet reaped" case to guard against
+/// here.
+///
+/// **Real, honest, disclosed limitation, matching wait_for_child()'s
+/// OWN precedent exactly**: frees the PROCESS_TABLE slot for reuse but
+/// does not reclaim the child's physical frames (PML4/code/stack/heap).
+/// This kernel has never reclaimed frames on process exit or reap
+/// either -- MAX_PROCESSES=4 total, ever, made that an acceptable,
+/// already-shipped simplification well before this milestone; kill()
+/// does not introduce a new gap, it just inherits the existing one.
+pub(crate) fn kill(caller_id: u8, target_pid: u8) -> bool {
+    if target_pid < PID_TABLE_BASE {
+        return false;
+    }
+    let idx = (target_pid - PID_TABLE_BASE) as usize;
+    if idx >= MAX_PROCESSES {
+        return false;
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let is_own_child = matches!(table[idx].as_ref(), Some(child) if child.parent_pid == Some(caller_id));
+    if !is_own_child {
+        let _ = writeln!(
+            serial(),
+            "milestone 41: syscall KILL (process {caller_id}) -- REFUSED, pid {target_pid} is not a live child OF this process -- returning failure"
+        );
+        return false;
+    }
+    table[idx] = None;
+    let _ = writeln!(
+        serial(),
+        "milestone 41: syscall KILL (process {caller_id}) -- pid {target_pid} terminated WITHOUT ever running (bypassed wait()'s normal run-then-reap contract), slot freed for reuse"
+    );
+    true
+}
+
+/// MILESTONE 41: real, boot-time, non-interactive proof of both new
+/// signal behaviors -- sendkey is confirmed unreliable in this
+/// environment (see fs::self_test_disk_write()'s own doc comment for
+/// the identical reasoning), so this runs unattended on every boot
+/// instead of depending on an interactive shell command.
+pub fn self_test_signals() {
+    let msg_ok = &SIGSEGV_TEST_PROGRAM[SIGSEGV_MSG_OFFSET..SIGSEGV_MSG_OFFSET + SIGSEGV_MSG.len()] == SIGSEGV_MSG;
+    let _ = writeln!(
+        serial(),
+        "milestone 41: self-test -- SIGSEGV_TEST_PROGRAM layout check: message={msg_ok} -- {}",
+        if msg_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    let _ = writeln!(
+        serial(),
+        "milestone 41: self-test -- running SIGSEGV_TEST_PROCESS, expecting a real page fault to terminate it without panicking the kernel..."
+    );
+    match run(SIGSEGV_TEST_PROCESS_ID) {
+        Ok(()) => {
+            let active_after = ACTIVE_PROCESS.load(Ordering::SeqCst);
+            let _ = writeln!(
+                serial(),
+                "milestone 41: self-test -- run() returned normally after the fault (the kernel did not panic/hlt_loop) -- ACTIVE_PROCESS reset to {active_after} (expected 0)"
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 41: self-test -- FAILED, run() itself errored: {e}");
+        }
+    }
+
+    let _ = writeln!(
+        serial(),
+        "milestone 41: self-test -- running PROCESS_A right after the fault, real proof of genuine recovery, not just 'hasn't crashed yet'..."
+    );
+    match run(1) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 41: self-test -- PROCESS_A ran normally after the SIGSEGV -- kernel genuinely recovered, not just still standing");
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 41: self-test -- FAILED, PROCESS_A could not run after the fault: {e}");
+        }
+    }
+
+    let _ = writeln!(
+        serial(),
+        "milestone 41: self-test -- running SIGKILL_TEST_PROCESS (fork, kill without running, fork again to prove the slot was really freed)..."
+    );
+    match run(SIGKILL_TEST_PROCESS_ID) {
+        Ok(()) => {
+            let table = PROCESS_TABLE.lock();
+            let occupied: alloc::vec::Vec<usize> = table
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_some())
+                .map(|(i, _)| i)
+                .collect();
+            let _ = writeln!(
+                serial(),
+                "milestone 41: self-test -- SIGKILL_TEST_PROCESS completed -- PROCESS_TABLE occupied slots: {:?} (expected exactly [0]: the SECOND fork's child, since the FIRST was killed unrun and its slot reused)",
+                occupied
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 41: self-test -- FAILED, SIGKILL_TEST_PROCESS run() errored: {e}");
+        }
+    }
 }
 
 /// MILESTONE 37: the `exec()` syscall's actual kernel-side

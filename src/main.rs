@@ -1,6 +1,36 @@
 use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 use std::env;
+use std::fs;
 use std::process::{Command, exit};
+
+// MILESTONE 40 investigation: ata.rs (since Milestone 11) has always
+// targeted the SECONDARY ATA bus (ports 0x170-0x177) for weight
+// persistence, on the documented assumption that "a separate, dedicated
+// disk image is attached there... in the verification harness" -- but no
+// such harness ever actually existed in this runner. Every `cargo run`
+// since Milestone 11 has launched QEMU with exactly one drive (the boot
+// image, implicitly primary-master), leaving the secondary bus
+// unclaimed. Reading/writing an unclaimed IDE bus in QEMU reads back
+// with the ERR status bit set, which is exactly the "ATA error bit set"
+// fs::self_test_disk_write() started catching once something finally
+// checked write_sector()'s real return value instead of only silently
+// discarding it via `.ok()?` in load_weights() (see ata.rs). This
+// creates and attaches a real, stable-across-runs persistence disk so
+// ata.rs finally has a real secondary-bus device to talk to, matching
+// what its own module doc always claimed.
+fn ensure_persist_disk() -> String {
+    let path = "target/persist.img";
+    if !std::path::Path::new(path).exists() {
+        // 1 MiB is far more than the single 512-byte sector ata.rs
+        // currently uses, but leaves real headroom without any real
+        // cost -- an all-zero image reads back as a blank disk (no
+        // magic match), the same honest "no saved weights" state
+        // load_weights() already handles correctly.
+        let blank = vec![0u8; 1024 * 1024];
+        fs::write(path, blank).expect("failed to create target/persist.img");
+    }
+    path.to_string()
+}
 
 // Runs the built kernel disk image in QEMU -- this is the "run it
 // virtually" piece: iterate against a real emulated x86_64 machine with
@@ -49,6 +79,16 @@ fn main() {
         cmd.arg("-monitor")
             .arg(format!("tcp:127.0.0.1:{port},server,nowait"));
     }
+    // Diagnostic-only, opt-in via env var (same pattern as the monitor port
+    // above) -- full interrupt/exception cascade + CPU-reset trace to a
+    // file, and --no-reboot so a triple fault halts QEMU instead of
+    // silently rebooting past it. Same technique this project's own M41
+    // diagnostic history already used successfully.
+    if env::var("SPIKELING_QEMU_TRACE").is_ok() {
+        cmd.arg("-d").arg("int,cpu_reset");
+        cmd.arg("-D").arg("qemu_trace.log");
+        cmd.arg("--no-reboot");
+    }
 
     if uefi {
         let prebuilt =
@@ -68,6 +108,16 @@ fn main() {
     } else {
         cmd.arg("-drive").arg(format!("format=raw,file={bios_path}"));
     }
+
+    // ata.rs's dedicated secondary-bus persistence disk -- explicit
+    // bus=ide.1 (secondary controller) unit=0 (master) so it lands at
+    // exactly the ports (0x170-0x177) ata.rs targets, regardless of
+    // QEMU version-specific implicit-index defaults for the boot drive
+    // above.
+    let persist_path = ensure_persist_disk();
+    cmd.arg("-drive")
+        .arg(format!("id=persist,format=raw,file={persist_path},if=none"));
+    cmd.arg("-device").arg("ide-hd,drive=persist,bus=ide.1,unit=0");
 
     let mut child = cmd.spawn().expect(
         "failed to start qemu-system-x86_64 -- install QEMU first (e.g. apt install qemu-system-x86 \

@@ -32,6 +32,63 @@
 //! constants that Milestone 9/10 actually verified (threshold, leak,
 //! refractory period, STDP rate/tau, initial weight) are unchanged --
 //! see neurons.rs for the exact values preserved at seed time.
+//!
+//! MILESTONE 39: real two-timescale, evidence-gated connectivity --
+//! ported from a separate, real project (`012-ternary`'s `tritkit`,
+//! `tritkit/twotimescale.py`'s `TwoTimescaleLinear`), NOT invented from
+//! scratch. tritkit's own real mechanism: factorize a connection into a
+//! FAST polarity/sign (trained every step) and a SLOW binary
+//! connectivity gate `G` (re-selected only periodically, from an EMA of
+//! evidence that is DELIBERATELY NOT the weight itself). tritkit's own
+//! module doc documents a REAL, MEASURED failure mode from an earlier
+//! version of that codebase: gating a connection from its own current
+//! weight is self-reinforcing (a weak connection gets gated off, so it
+//! never again accumulates the activity needed to prove it should turn
+//! back on -- permanently locked out). Their fix: the gate integrates
+//! an EMA of something INDEPENDENT of the weight -- for them, the full
+//! UNGATED gradient magnitude (computed for every parameter every step,
+//! whether currently live or dormant). Ported here as:
+//!   - FAST clock (every tick a synapse's endpoint fires): update
+//!     `Synapse.evidence`, an EMA of REAL pre/post firing correlation
+//!     (did the post-synaptic neuron fire within CORRELATION_WINDOW_TICKS
+//!     of the pre-synaptic neuron firing) -- a genuine, independent
+//!     sensing channel, computed from firing TIMING, never from
+//!     `Synapse.weight`. Runs for every synapse regardless of its gate
+//!     state (see evidence loop in tick(), below) -- the exact property
+//!     tritkit's own history says is required to avoid permanent
+//!     lockout.
+//!   - SLOW clock (every GATE_PERIOD_TICKS ticks, deliberately
+//!     INCOMMENSURATE with the fast evidence-accumulation cadence --
+//!     tritkit's own `golden_period()`, golden-ratio spaced, ported
+//!     verbatim as `golden_period()` below): re-evaluate
+//!     `Synapse.gate` from `Synapse.evidence` (hysteresis band, see
+//!     `evaluate_gates()`).
+//!   - Gate OFF: `Synapse.weight` is FROZEN (STDP skipped, see the STDP
+//!     loop's `gate &&` guard) and the synapse's contribution is
+//!     REMOVED from real propagation (see the propagation loop's
+//!     `s.gate` filter) -- tritkit's "structural memory": dormant state
+//!     is preserved unchanged, not reset/re-randomized, so a later
+//!     reconnect resumes exactly where it left off.
+//!   - Gate back ON: evaluated the same way, from the same evidence EMA
+//!     -- real reconnection, not just structurally possible.
+//! Honest scope, matching this project's own "honest bound, not full
+//! generality" style (see e.g. `MAX_OPEN_FILES`/`MAX_LOAD_SEGMENTS`):
+//! `Synapse.gate` is a plain bool (tritkit's `G` is a whole tensor of
+//! gates with a density-fraction selection rule; one synapse here is
+//! the same idea at kernel scale, an absolute evidence threshold with
+//! hysteresis instead of a population-relative top-fraction rule).
+//! `train_synapse()` (the M17/21 controlled STDP trial, used by bare
+//! `train` and DSL `train FROM TO GAP`) intentionally bypasses BOTH
+//! real tick()-driven dynamics AND this gating layer, exactly as it
+//! already bypassed real propagation timing before this milestone --
+//! it's a synthetic trial tool, not real network dynamics, so it
+//! continues to always apply STDP directly regardless of gate state,
+//! preserving Milestone 17/21's exact regression behavior byte-for-
+//! byte. Gate state and evidence are NOT persisted to disk (Milestone
+//! 38's scope only covers `Synapse.weight`) -- same disclosed
+//! "topology doesn't persist" limitation as before, extended to say
+//! gate/evidence also start fresh (gate=ON, evidence=neutral) every
+//! boot.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -55,6 +112,24 @@ pub struct Synapse {
     pub from: usize,
     pub to: usize,
     pub weight: f32,
+    /// MILESTONE 39: slow-clock connectivity gate. true = live (this
+    /// synapse's weight both propagates real stimulus AND keeps
+    /// learning via STDP); false = dormant (weight FROZEN, no
+    /// propagation) -- see the module doc above.
+    pub gate: bool,
+    /// MILESTONE 39: EMA of REAL pre/post firing correlation,
+    /// deliberately independent of `weight` -- the evidence the slow
+    /// clock gates on. See `update_evidence()`/module doc.
+    pub evidence: f32,
+    /// MILESTONE 39: tick a pre-synaptic fire opened a correlation
+    /// window at, if one is currently open and not yet resolved
+    /// (hit or expiry). Private: only `tick()`'s evidence pass touches
+    /// this. Honest bound, not full generality: only the MOST RECENT
+    /// pending window is tracked, matching one open window at a time
+    /// -- a synapse whose pre-neuron fires again before the previous
+    /// window resolves loses that earlier window's verdict rather than
+    /// tracking multiple overlapping windows.
+    pending_pre_fire_tick: Option<u64>,
 }
 
 pub struct GenericNetwork {
@@ -67,7 +142,7 @@ pub struct GenericNetwork {
 
 // Real STDP -- the ONE implementation in the kernel as of Milestone 21
 // (previously duplicated near-verbatim in neurons.rs; that copy is
-// gone, this is the only one left). Δw = rate * exp(-|dt|/tau),
+// gone, this is the only one left). Delta-w = rate * exp(-|dt|/tau),
 // pre-before-post -> LTP, pre-after-post -> LTD, clamped [0,1].
 const STDP_RATE: f32 = 0.1;
 const STDP_TAU_MS: f32 = 20.0;
@@ -87,6 +162,96 @@ fn apply_stdp(weight: &mut f32, pre_last_fire: Option<u64>, post_last_fire: Opti
             *weight = (*weight - delta).max(0.0);
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// MILESTONE 39: two-timescale evidence gating -- see the module doc
+// above for the full design rationale (ported from tritkit's
+// TwoTimescaleLinear, 012-ternary/tritkit/twotimescale.py).
+// ---------------------------------------------------------------------
+
+/// Newly-created synapses (`addsynapse`, `seed_fixed_network`) start
+/// gated ON with evidence at this neutral, fully-trusted value --
+/// mirrors tritkit's own fallback rule ("score = evidence if evidence
+/// has accumulated, else fall back to |u|", i.e. don't punish a
+/// connection for evidence it hasn't had the chance to accumulate yet)
+/// applied the simplest way that keeps a brand new synapse's default
+/// behavior identical to every milestone before this one until real
+/// evidence says otherwise.
+const INITIAL_EVIDENCE: f32 = 1.0;
+
+/// "Did the post-synaptic neuron fire within a SHORT window after the
+/// pre-synaptic neuron fired" -- the real, chosen evidence signal (see
+/// module doc: independent of `weight`, a genuine timing-coincidence
+/// statistic). 15 ticks (~825ms @ ~18.2Hz) is short relative to the
+/// multi-second gaps between deliberately-uncorrelated stimulation in
+/// this milestone's own verification, but generous enough to reliably
+/// capture two real, separately-issued shell `stim` commands landing
+/// close together -- unlike STDP_TAU_MS=20ms (Milestone 17 already
+/// found even a ~1000ms real inter-command gap underflows that to
+/// zero), this window doesn't need millisecond precision, so it's set
+/// in the range real shell interaction can actually land in.
+const CORRELATION_WINDOW_TICKS: u64 = 15;
+
+/// EMA smoothing for `Synapse.evidence`. tritkit's own demo used 0.95
+/// (per fixed-rate optimizer STEP); this evidence updates on real,
+/// naturally sparser firing EVENTS instead, so a faster-adapting 0.8 was
+/// chosen so evidence swings across the hysteresis band within roughly
+/// a dozen real, observable firing events -- verifiable in one
+/// interactive QEMU session, not a hypothetical long-run average.
+const EVIDENCE_BETA: f32 = 0.8;
+
+/// Gate re-evaluation hysteresis band -- turns OFF only below
+/// GATE_OFF_THRESHOLD, back ON only above GATE_ON_THRESHOLD; in
+/// between, whatever the gate currently is stays unchanged. A real,
+/// deliberate design choice (not in tritkit's own top-density-fraction
+/// selection rule, which doesn't need it): without hysteresis, evidence
+/// sitting right at a single boundary would flap the gate on/off every
+/// slow tick from ordinary hit/miss noise.
+const GATE_ON_THRESHOLD: f32 = 0.5;
+const GATE_OFF_THRESHOLD: f32 = 0.2;
+
+/// The "fast" timescale golden_period() is spaced away from --
+/// Milestone 9's own REFRACTORY_TICKS=7 (~400ms @ ~18.2Hz, the minimum
+/// spacing between successive firings for the seeded LeftKey/RightKey/
+/// Motor neurons), this kernel's own already-established fast neural
+/// cadence, reused rather than inventing a fresh number for this
+/// milestone.
+const FAST_TAU_TICKS: u64 = 7;
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Ported verbatim (formula-wise) from tritkit's own `golden_period()`:
+/// gate period INCOMMENSURATE with the fast timescale, specifically to
+/// avoid resonance/lockstep between the fast (evidence-accumulation)
+/// and slow (gate-reevaluation) clocks -- tritkit's own documented
+/// reason, not invented here. `golden_period(7) == 18` (round(phi^2*7)
+/// = round(18.33) = 18; gcd(18,7)=1, already coprime) -- ~990ms @
+/// ~18.2Hz, i.e. the gate is re-checked roughly once a second, on a
+/// cadence that never lines up evenly with the 7-tick fast cadence.
+fn golden_period(fast_tau: u64) -> u64 {
+    const PHI: f32 = 1.618_034;
+    let mut p = (libm::roundf(PHI * PHI * fast_tau as f32) as u64).max(2);
+    loop {
+        if gcd(p, fast_tau.max(1)) == 1 {
+            return p;
+        }
+        p += 1;
+    }
+}
+
+/// EMA update for one synapse's evidence -- `hit`=true means the
+/// post-synaptic neuron fired within CORRELATION_WINDOW_TICKS of the
+/// pre-synaptic neuron firing (real timing coincidence), `hit`=false
+/// means a window expired with no such firing. Never reads or writes
+/// `weight` -- the independent-sensing-channel property tritkit's own
+/// module doc identifies as the fix for the self-reinforcing lockout
+/// failure mode.
+fn update_evidence(evidence: &mut f32, hit: bool) {
+    let sample = if hit { 1.0 } else { 0.0 };
+    *evidence = *evidence * EVIDENCE_BETA + sample * (1.0 - EVIDENCE_BETA);
 }
 
 const BEEP_FREQ_HZ: u32 = 600;
@@ -132,7 +297,14 @@ impl GenericNetwork {
     fn add_synapse(&mut self, from: &str, to: &str, weight: f32) -> Result<(), String> {
         let from_i = self.find(from).ok_or_else(|| format!("no such neuron '{from}'"))?;
         let to_i = self.find(to).ok_or_else(|| format!("no such neuron '{to}'"))?;
-        self.synapses.push(Synapse { from: from_i, to: to_i, weight });
+        self.synapses.push(Synapse {
+            from: from_i,
+            to: to_i,
+            weight,
+            gate: true,
+            evidence: INITIAL_EVIDENCE,
+            pending_pre_fire_tick: None,
+        });
         Ok(())
     }
 
@@ -156,6 +328,14 @@ impl GenericNetwork {
     /// LeftKey->Motor, exactly as Milestone 10 verified) -- one function
     /// instead of two separate copies of "set two fire ticks gap_ticks
     /// apart and call apply_stdp".
+    ///
+    /// MILESTONE 39: deliberately bypasses gating entirely (does not
+    /// read or write `gate`/`evidence`, always applies STDP directly)
+    /// -- same reasoning as it already bypassing real tick()-driven
+    /// propagation timing since Milestone 17/21: a synthetic trial
+    /// tool, not real network dynamics, so it stays exactly
+    /// regression-safe against every prior milestone's own verified
+    /// numbers.
     fn train_synapse(&mut self, from: &str, to: &str, gap_ticks: u64, pre_first: bool) -> Result<(f32, f32), String> {
         let from_i = self.find(from).ok_or_else(|| format!("no such neuron '{from}'"))?;
         let to_i = self.find(to).ok_or_else(|| format!("no such neuron '{to}'"))?;
@@ -184,6 +364,22 @@ impl GenericNetwork {
         Ok((before, self.synapses[syn_i].weight))
     }
 
+    /// MILESTONE 39: slow-clock gate re-evaluation, called from tick()
+    /// only every golden_period(FAST_TAU_TICKS) ticks. Hysteresis band
+    /// (GATE_OFF_THRESHOLD..=GATE_ON_THRESHOLD): only flips gate OFF
+    /// when evidence has genuinely dropped low, only flips it back ON
+    /// when evidence has genuinely recovered high -- see the constants'
+    /// doc comments above for why.
+    fn evaluate_gates(&mut self) {
+        for syn in self.synapses.iter_mut() {
+            if syn.gate && syn.evidence < GATE_OFF_THRESHOLD {
+                syn.gate = false;
+            } else if !syn.gate && syn.evidence > GATE_ON_THRESHOLD {
+                syn.gate = true;
+            }
+        }
+    }
+
     /// One tick over the WHOLE network: leak + stimulus + threshold
     /// check for every neuron, then propagate any firings through
     /// synapses for the NEXT tick.
@@ -198,6 +394,16 @@ impl GenericNetwork {
     ///
     /// MILESTONE 14: any firing also triggers a real, automatic,
     /// self-silencing speaker blip.
+    ///
+    /// MILESTONE 39: a real fast-clock evidence pass (every tick, every
+    /// synapse, regardless of gate) and a real slow-clock gate
+    /// re-evaluation (every golden_period(FAST_TAU_TICKS) ticks) --
+    /// see the module doc and the constants above for the full design.
+    /// Gated-off synapses are excluded from the propagation step AND
+    /// the STDP step below (frozen), but NOT from the evidence step
+    /// (must keep sensing while dormant, or it could never prove it
+    /// deserves to reconnect -- the exact bug tritkit's own history
+    /// documents).
     fn tick(&mut self) {
         let tick_n = self.tick_count;
         self.tick_count += 1;
@@ -221,25 +427,62 @@ impl GenericNetwork {
         for s in self.pending_stimulus.iter_mut() {
             *s = 0.0;
         }
+
+        // MILESTONE 39: fast-clock evidence update -- runs for EVERY
+        // synapse this tick, regardless of gate state (see module doc).
+        for syn in self.synapses.iter_mut() {
+            if fired.contains(&syn.to) {
+                if let Some(pre_tick) = syn.pending_pre_fire_tick {
+                    if tick_n - pre_tick <= CORRELATION_WINDOW_TICKS {
+                        update_evidence(&mut syn.evidence, true);
+                        syn.pending_pre_fire_tick = None;
+                    }
+                }
+            }
+            if let Some(pre_tick) = syn.pending_pre_fire_tick {
+                if tick_n - pre_tick > CORRELATION_WINDOW_TICKS {
+                    update_evidence(&mut syn.evidence, false);
+                    syn.pending_pre_fire_tick = None;
+                }
+            }
+            if fired.contains(&syn.from) {
+                syn.pending_pre_fire_tick = Some(tick_n);
+            }
+        }
+
         // propagate: firings THIS tick become stimulus for the NEXT
         // tick (a real one-tick synaptic delay -- see the Milestone 21
         // header comment for why this now also applies to
-        // LeftKey/RightKey/Motor, not just DSL-built networks)
+        // LeftKey/RightKey/Motor, not just DSL-built networks).
+        // MILESTONE 39: gated-OFF synapses are skipped here -- the
+        // real, observable behavior change of dormancy (see module
+        // doc).
         for src in fired.iter() {
-            for syn in self.synapses.iter().filter(|s| s.from == *src) {
+            for syn in self.synapses.iter().filter(|s| s.from == *src && s.gate) {
                 self.pending_stimulus[syn.to] += syn.weight * SPIKE_GAIN;
             }
         }
 
         // MILESTONE 17: real STDP on every synapse touching a neuron
-        // that just fired this tick.
+        // that just fired this tick. MILESTONE 39: gated-OFF synapses
+        // are skipped -- their weight/sign is FROZEN, not just
+        // unpropagated (tritkit's "structural memory": dormant state is
+        // preserved unchanged so a later reconnect resumes exactly
+        // where it left off, not from scratch).
         for syn_idx in 0..self.synapses.len() {
-            let (from, to) = (self.synapses[syn_idx].from, self.synapses[syn_idx].to);
-            if fired.contains(&from) || fired.contains(&to) {
+            let (from, to, gate) = (self.synapses[syn_idx].from, self.synapses[syn_idx].to, self.synapses[syn_idx].gate);
+            if gate && (fired.contains(&from) || fired.contains(&to)) {
                 let pre = self.neurons[from].last_fire_tick;
                 let post = self.neurons[to].last_fire_tick;
                 apply_stdp(&mut self.synapses[syn_idx].weight, pre, post);
             }
+        }
+
+        // MILESTONE 39: slow-clock gate re-evaluation -- deliberately
+        // incommensurate with the fast evidence cadence (see
+        // golden_period()'s doc comment).
+        if tick_n % golden_period(FAST_TAU_TICKS) == 0 {
+            self.evaluate_gates();
         }
 
         if !fired.is_empty() {
@@ -268,8 +511,12 @@ impl GenericNetwork {
             out.push_str("synapses:\n");
             for s in &self.synapses {
                 out.push_str(&format!(
-                    "  {} -> {} weight={:.3}\n",
-                    self.neurons[s.from].name, self.neurons[s.to].name, s.weight
+                    "  {} -> {} weight={:.3} gate={} evidence={:.3}\n",
+                    self.neurons[s.from].name,
+                    self.neurons[s.to].name,
+                    s.weight,
+                    if s.gate { "ON" } else { "OFF" },
+                    s.evidence
                 ));
             }
         }
@@ -337,6 +584,17 @@ pub fn synapse_weight(from: &str, to: &str) -> Option<f32> {
     let from_i = net.find(from)?;
     let to_i = net.find(to)?;
     net.synapses.iter().find(|s| s.from == from_i && s.to == to_i).map(|s| s.weight)
+}
+
+/// MILESTONE 39: named lookup for a synapse's current gate state and
+/// accumulated evidence, so this is directly observable (not just
+/// internal state to trust exists) from neurons.rs's fixed report and
+/// any other caller. `(gate, evidence)`.
+pub fn synapse_gate_state(from: &str, to: &str) -> Option<(bool, f32)> {
+    let net = NET.lock();
+    let from_i = net.find(from)?;
+    let to_i = net.find(to)?;
+    net.synapses.iter().find(|s| s.from == from_i && s.to == to_i).map(|s| (s.gate, s.evidence))
 }
 
 /// MILESTONE 38: every synapse currently in the network, named by its

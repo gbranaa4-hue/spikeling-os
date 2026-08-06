@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, background, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedlibctest\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -266,20 +266,6 @@ fn run_command(cmd: &str) {
             "speaker gate register enabled={}\n",
             crate::speaker::is_enabled()
         )),
-        "background" => crate::console::write_str(&format!(
-            "usage: background on|off (currently {})\n",
-            if crate::tasks::background_scheduling_enabled() { "on" } else { "off" }
-        )),
-        "background on" => {
-            crate::tasks::enable_background_scheduling();
-            crate::console::write_str(
-                "background scheduling ON -- spawn/kill get real CPU time now. NOTE: this session's own testing found a real, unresolved reliability issue -- runfile/runelf can intermittently page-fault if background scheduling has been on for a while first (see README.md's Milestone 36 entry). Turn it back off before using runfile/runelf if you hit that.\n",
-            );
-        }
-        "background off" => {
-            crate::tasks::disable_background_scheduling();
-            crate::console::write_str("background scheduling OFF -- spawned tasks are paused (not killed) until turned back on; runfile/runelf are reliable in this mode.\n");
-        }
         "silence" => {
             crate::speaker::stop();
             crate::console::write_str(&format!(
@@ -451,6 +437,35 @@ fn run_command(cmd: &str) {
                 Err(e) => crate::console::write_str(&format!("runfork FAILED: {e}\n")),
             }
         }
+        "runsigsegv" => {
+            // MILESTONE 41: runs SIGSEGV_TEST_PROGRAM via process.rs's
+            // SIXTH hardcoded process slot -- deliberately dereferences
+            // an unmapped address, triggering a real page fault. If
+            // SIGSEGV handling works, this command returns normally
+            // (see serial log for the real "process N page-faulted...
+            // terminating this process, kernel continues" line) instead
+            // of hanging the whole kernel the way any page fault used to
+            // before this milestone.
+            match crate::process::run(crate::process::SIGSEGV_TEST_PROCESS_ID) {
+                Ok(()) => crate::console::write_str(
+                    "runsigsegv: process page-faulted and was terminated -- kernel survived, see serial log for the real fault details\n",
+                ),
+                Err(e) => crate::console::write_str(&format!("runsigsegv FAILED: {e}\n")),
+            }
+        }
+        "runsigkill" => {
+            // MILESTONE 41: runs SIGKILL_TEST_PROGRAM via process.rs's
+            // SEVENTH hardcoded process slot -- forks a child, kill()s
+            // it without ever running it, then forks again to prove the
+            // slot was really freed. See serial log for the real KILL
+            // syscall trace and both FORK results.
+            match crate::process::run(crate::process::SIGKILL_TEST_PROCESS_ID) {
+                Ok(()) => crate::console::write_str(
+                    "runsigkill: fork()/kill()/fork() ran to completion -- see serial log for the real syscall trace\n",
+                ),
+                Err(e) => crate::console::write_str(&format!("runsigkill FAILED: {e}\n")),
+            }
+        }
         "seedtestelf" => {
             // MILESTONE 36: writes this milestone's REAL, externally-
             // built ELF64 test executable (loader::TEST_ELF_BYTES,
@@ -466,20 +481,19 @@ fn run_command(cmd: &str) {
                 Err(e) => crate::console::write_str(&format!("seedtestelf FAILED: {e}\n")),
             }
         }
-        "seedlibctest" => {
-            // MILESTONE 39: writes this milestone's real ELF64 test
-            // executable, built against this project's OWN minimal libc
-            // (tools/libc_test_src/libc.rs) -- the first user program
-            // that calls write()/sbrk()/fork()/wait()/exit() as ordinary
-            // Rust function calls instead of hand-assembled `int 0x80`
-            // sequences. Run with 'runelf libctest' (same command
-            // Milestone 36's ELF loader already provides -- no new
-            // "run" path needed, this is just another real ELF file).
-            match crate::loader::seed_libc_test() {
+        "seedpipetest" => {
+            // MILESTONE 40: writes this milestone's REAL, externally-
+            // built ELF64 test executable (loader::PIPETEST_ELF_BYTES,
+            // built the same way TEST_ELF_BYTES is -- rustc+rust-lld,
+            // not hand-assembled) to a real file ("pipetest") on the
+            // real on-disk filesystem. `runelf` (already generic over
+            // any path) is what actually runs it -- no new run-command
+            // needed.
+            match crate::loader::seed_pipetest_elf() {
                 Ok(len) => crate::console::write_str(&format!(
-                    "seedlibctest: wrote {len} real bytes to 'libctest' on disk (built against this project's own minimal libc) -- try 'runelf libctest'\n"
+                    "seedpipetest: wrote {len} real bytes to 'pipetest' on disk (a genuine ELF64 executable exercising pipe()/dup2(), not hand-assembled) -- try 'runelf pipetest'\n"
                 )),
-                Err(e) => crate::console::write_str(&format!("seedlibctest FAILED: {e}\n")),
+                Err(e) => crate::console::write_str(&format!("seedpipetest FAILED: {e}\n")),
             }
         }
         "clear" => crate::console::clear_screen(),
@@ -651,35 +665,12 @@ fn run_command(cmd: &str) {
                 // page-table mechanism Milestone 30 built for
                 // PROCESS_A/PROCESS_B, just fed from a real file read
                 // instead of a compiled-in array.
-                // BUGFIX (root-causing the disclosed Milestone 36 page
-                // fault, shared with runelf below, confirmed via repeated
-                // real trials -- see tasks::RING3_EXCURSION_ACTIVE's own
-                // doc comment for the full diagnosis): this whole match
-                // arm runs nested inside the keyboard interrupt handler's
-                // own call chain (on_char -> run_command), same as every
-                // shell command, but this one -- unlike a fast command
-                // like `about` -- does real, measurable work (frame
-                // allocation, page mapping, a ring-3 excursion, THEN
-                // printing the result) with CURRENT still == usize::MAX
-                // the whole time. A background-scheduler timer tick
-                // landing ANYWHERE in that stretch (not just during the
-                // excursion, not just during construction -- two
-                // narrower guards were tried and measured to have zero
-                // effect) can still switch a task away mid-flight and
-                // corrupt tasks::KERNEL_RSP. Decisively confirmed as the
-                // real mechanism: 12/12 real trials passed with
-                // background scheduling disabled entirely, vs. ~60-70%
-                // failure with it on. This guard covers the loader call
-                // AND the result-printing that follows, both nested in
-                // the same fragile window.
-                crate::tasks::RING3_EXCURSION_ACTIVE.store(true, core::sync::atomic::Ordering::SeqCst);
                 match crate::loader::run_file(path.trim()) {
                     Ok(()) => crate::console::write_str(
                         "runfile: loaded from disk and ran under its own private page table -- write+exit syscalls returned cleanly, see serial log for the message it printed (proof it came from the file) + hardware CPL confirmation\n",
                     ),
                     Err(e) => crate::console::write_str(&format!("{e}\n")),
                 }
-                crate::tasks::RING3_EXCURSION_ACTIVE.store(false, core::sync::atomic::Ordering::SeqCst);
             } else if let Some(path) = other.strip_prefix("runelf ") {
                 // MILESTONE 36: real ELF64 loader -- reads `path`'s
                 // bytes off the actual on-disk filesystem (same as
@@ -695,16 +686,12 @@ fn run_command(cmd: &str) {
                 // equal USER_CODE_ADDR exactly, since the ring-3 entry
                 // trampoline's jump target was deliberately kept fixed
                 // rather than made dynamic this milestone).
-                // BUGFIX: same guard as runfile above -- see its comment
-                // for the full diagnosis.
-                crate::tasks::RING3_EXCURSION_ACTIVE.store(true, core::sync::atomic::Ordering::SeqCst);
                 match crate::loader::run_elf(path.trim()) {
                     Ok(()) => crate::console::write_str(
                         "runelf: parsed a REAL ELF64 file, mapped its PT_LOAD segments at their own vaddrs, and ran it under its own private page table -- write+exit syscalls returned cleanly, see serial log for the parsed e_entry/segments + the message it printed (proof execution reached a non-zero-offset segment) + hardware CPL confirmation\n",
                     ),
                     Err(e) => crate::console::write_str(&format!("{e}\n")),
                 }
-                crate::tasks::RING3_EXCURSION_ACTIVE.store(false, core::sync::atomic::Ordering::SeqCst);
             } else if let Some(rest) = other.strip_prefix("pixel ") {
                 match parse_usize_args::<2>(rest) {
                     Some([x, y]) => {

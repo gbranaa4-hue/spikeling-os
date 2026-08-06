@@ -41,6 +41,14 @@
 //! writing the SAME synapses `net`/`stim`/`train FROM TO GAP` also
 //! reach. There is exactly one apply_stdp() left in the kernel, in
 //! network.rs; the copy that used to live here is gone.
+//!
+//! MILESTONE 39: the fixed-format report below also now surfaces each
+//! fixed synapse's real gate state and accumulated evidence (see
+//! network.rs's synapse_gate_state(), and network.rs's module doc for
+//! the full two-timescale gating design -- ported from tritkit's
+//! TwoTimescaleLinear). Nothing else in this file changed: gating lives
+//! entirely in network.rs's GenericNetwork::tick(), this is purely a
+//! read-only view addition.
 
 use alloc::format;
 use alloc::string::String;
@@ -148,7 +156,9 @@ pub fn left_to_motor_weight() -> f32 {
 /// called from the shell's bare `train` command -- now just a named
 /// call into network.rs's ONE train_synapse()/apply_stdp()
 /// implementation (the same one `train FROM TO GAP_TICKS` uses), on the
-/// SAME synapse `net` reports.
+/// SAME synapse `net` reports. MILESTONE 39: train_synapse() itself
+/// bypasses gating entirely (see its own doc comment in network.rs) --
+/// this call is completely unaffected by the new gating layer.
 pub fn run_training_trial(ltp: bool, gap_ticks: u64) {
     let _ = crate::network::train_synapse(LEFT_KEY, MOTOR, gap_ticks, ltp);
 }
@@ -156,13 +166,21 @@ pub fn run_training_trial(ltp: bool, gap_ticks: u64) {
 /// Fixed-format report, kept distinct from `net`'s generic table for
 /// continuity with Milestone 9-11's existing shell output -- reads the
 /// SAME underlying neurons network.rs owns, not a separate copy.
+///
+/// MILESTONE 39: now also reports each fixed synapse's real gate state
+/// and accumulated evidence (network.rs::synapse_gate_state()) --
+/// directly observable, not just internal state to trust exists.
 pub fn report() -> String {
     let (lv, lf) = crate::network::neuron_state(LEFT_KEY).unwrap_or((0.0, 0));
     let (rv, rf) = crate::network::neuron_state(RIGHT_KEY).unwrap_or((0.0, 0));
     let (mv, mf) = crate::network::neuron_state(MOTOR).unwrap_or((0.0, 0));
     let lw = crate::network::synapse_weight(LEFT_KEY, MOTOR).unwrap_or(0.0);
     let rw = crate::network::synapse_weight(RIGHT_KEY, MOTOR).unwrap_or(0.0);
+    let (lg, lev) = crate::network::synapse_gate_state(LEFT_KEY, MOTOR).unwrap_or((true, 0.0));
+    let (rg, rev) = crate::network::synapse_gate_state(RIGHT_KEY, MOTOR).unwrap_or((true, 0.0));
     format!(
-        "LeftKey  V={lv:5.1} fires={lf}\nRightKey V={rv:5.1} fires={rf}\nMotor    V={mv:5.1} fires={mf}  (threshold=80; MILESTONE 21: firing now propagates to Motor on the NEXT tick, via network.rs's shared one-tick synaptic delay, not the same tick)\nweights: LeftKey->Motor={lw:.4}  RightKey->Motor={rw:.4}\n"
+        "LeftKey  V={lv:5.1} fires={lf}\nRightKey V={rv:5.1} fires={rf}\nMotor    V={mv:5.1} fires={mf}  (threshold=80; MILESTONE 21: firing now propagates to Motor on the NEXT tick, via network.rs's shared one-tick synaptic delay, not the same tick)\nweights: LeftKey->Motor={lw:.4} (gate={}, evidence={lev:.3})  RightKey->Motor={rw:.4} (gate={}, evidence={rev:.3})\n",
+        if lg { "ON" } else { "OFF" },
+        if rg { "ON" } else { "OFF" }
     )
 }
